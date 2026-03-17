@@ -2,11 +2,25 @@
   "version": 1,
   "rules": [
     {
+      "description": "Email address",
+      "trigger": "@",
+      "search": "\\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}\\b",
+      "replace": "[EMAIL]",
+      "caseSensitive": "true"
+    },
+    {
       "description": "HDFS /user/<name>/ path",
       "trigger": "/user/",
       "search": "(?i)(/user/)([A-Za-z0-9._-]+)(/)",
       "replace": "\\1[USER]\\3",
       "caseSensitive": "false"
+    },
+    {
+      "description": "UUID",
+      "trigger": "-",
+      "search": "\\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\\b",
+      "replace": "[UUID]",
+      "caseSensitive": "true"
     },
     {
       "description": "user=... (key/value)",
@@ -24,4 +38,3 @@
     }
   ]
 }
-
