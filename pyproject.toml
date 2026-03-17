@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "log-anonymizer"
+version = "0.1.0"
+description = "CLI tool to anonymize Hadoop/Cloudera logs (HDFS, YARN, Hive, Spark, Impala, etc.)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Proprietary" }
+authors = [{ name = "Squad Data" }]
+dependencies = []
+
+[project.scripts]
+log-anonymizer = "log_anonymizer.__main__:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+

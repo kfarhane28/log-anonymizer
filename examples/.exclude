@@ -1,0 +1,24 @@
+# Exclude common non-log artifacts and large/binary blobs from processing.
+*.jar
+*.class
+*.parquet
+*.orc
+*.avro
+*.snappy
+*.gz
+*.bz2
+*.xz
+*.7z
+*.tar
+*.tgz
+*.zip
+
+# Skip node/yarn cache and application history caches if present in support bundles.
+**/.yarn/**
+**/.cache/**
+**/yarn-cache/**
+
+# Example: exclude all stack traces, but keep one specific file.
+**/*stacktrace*
+!**/important-stacktrace.log
+

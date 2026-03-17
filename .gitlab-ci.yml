@@ -1,0 +1,26 @@
+stages:
+  - test
+
+default:
+  image: python:3.11-slim
+
+variables:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PIP_NO_CACHE_DIR: "0"
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+
+cache:
+  key: "pip-${CI_COMMIT_REF_SLUG}"
+  paths:
+    - .cache/pip
+
+pytest:
+  stage: test
+  script:
+    - python -V
+    - python -m venv .venv
+    - . .venv/bin/activate
+    - python -m pip install --upgrade pip
+    - python -m pip install -r requirements-dev.txt
+    - pytest -q
+
