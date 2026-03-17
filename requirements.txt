@@ -1,3 +1,2 @@
 # Runtime dependencies.
-# This project intentionally uses only the Python standard library.
-
+streamlit>=1.30.0
