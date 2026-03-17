@@ -19,6 +19,22 @@ pip install -r requirements.txt
 pip install -e .
 ```
 
+## Web UI (Streamlit)
+
+Launch the web UI:
+
+```bash
+source .venv/bin/activate
+streamlit run app.py
+```
+
+The UI exposes the same options as the CLI:
+- input: upload file/zip or provide a path
+- rules: upload JSON
+- exclude: upload `.exclude`
+- output directory
+- verbose / dry-run
+
 ## Quick start
 
 ### 1) Anonymize a directory of logs
@@ -84,4 +100,3 @@ Common options:
 
 - This tool processes files as text; it attempts UTF-8 decoding first and falls back to Latin-1.
 - It streams line-by-line to handle large log files.
-
