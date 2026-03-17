@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import NoReturn
 
 from log_anonymizer.builtin_rules import default_rules, merge_rules
+from log_anonymizer.config.app_config import load_config, resolve_config_path
 from log_anonymizer.config.logging_config import LogFormat, setup_logging
 from log_anonymizer.exclude_filter import ExcludeFilter
 from log_anonymizer.input_handler import handle_input
@@ -47,20 +48,26 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional .exclude file with glob patterns.",
     )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="Optional config file (INI). Default: ./log-anonymizer.ini or $LOG_ANONYMIZER_CONFIG",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Validate and report what would be processed without writing output.")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable DEBUG logging.")
     parser.add_argument("--exclude-case-insensitive", action="store_true", help="Case-insensitive exclude matching.")
     parser.add_argument("--no-default-rules", action="store_true", help="Do not include built-in Hadoop-sensitive rules.")
     parser.add_argument(
         "--log-level",
-        default="INFO",
-        help="Logging level (default: INFO).",
+        default=None,
+        help="Logging level (overrides config; default: INFO).",
     )
     parser.add_argument(
         "--log-format",
         choices=[e.value for e in LogFormat],
-        default=LogFormat.JSON.value,
-        help="Logging format: json (default) or text.",
+        default=None,
+        help="Logging format: json or text (overrides config; default: json).",
     )
     return parser
 
@@ -72,8 +79,15 @@ def main(argv: list[str] | None = None) -> None:
 
     args = _build_parser().parse_args(argv)
 
-    log_format = LogFormat(args.log_format)
-    level = "DEBUG" if args.verbose else args.log_level
+    cfg_path = resolve_config_path(args.config)
+    cfg = load_config(cfg_path)
+
+    fmt_str = args.log_format or cfg.logging.fmt or LogFormat.JSON.value
+    log_format = LogFormat(fmt_str)
+    if args.verbose:
+        level = "DEBUG"
+    else:
+        level = args.log_level or cfg.logging.level or "INFO"
     setup_logging(level=level, log_format=log_format)
 
     input_path = args.input

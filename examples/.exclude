@@ -13,6 +13,26 @@
 *.tgz
 *.zip
 
+# Exclude common credential/key material often present in Hadoop/Cloudera bundles.
+creds.localjceks
+creds.localjceks.sha
+*.jceks
+*.jceks.sha
+*.keytab
+krb5.conf
+jaas.conf
+*.jks
+*keystore*
+*truststore*
+*.p12
+*.pfx
+*.pem
+*.key
+*.crt
+*.cer
+*.der
+*.kdb
+
 # Skip node/yarn cache and application history caches if present in support bundles.
 **/.yarn/**
 **/.cache/**
@@ -21,4 +41,3 @@
 # Example: exclude all stack traces, but keep one specific file.
 **/*stacktrace*
 !**/important-stacktrace.log
-
