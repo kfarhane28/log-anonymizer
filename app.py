@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 import tempfile
@@ -103,10 +104,12 @@ def _init_state() -> None:
     st.session_state.setdefault("tmp_dir", None)
     st.session_state.setdefault("log_handler", None)
     st.session_state.setdefault("log_prev_handlers", None)
+    st.session_state.setdefault("ui_warnings", [])
 
 
 def _render_sidebar() -> PreparedRun:
     st.sidebar.header("Configuration")
+    st.session_state["ui_warnings"] = []
 
     input_mode: InputMode = st.sidebar.radio(
         "Input source",
@@ -140,6 +143,8 @@ def _render_sidebar() -> PreparedRun:
         verbose=verbose,
         dry_run=dry_run,
     )
+    for w in st.session_state.get("ui_warnings", []):
+        st.sidebar.warning(w)
     return prepared
 
 
@@ -172,7 +177,14 @@ def _prepare_files(
 
     exclude_path = None
     if uploaded_exclude is not None:
-        exclude_path = _save_upload(tmp_dir, uploaded_exclude, name_hint=".exclude")
+        raw = bytes(uploaded_exclude.getbuffer())
+        if _looks_like_json(raw) or str(uploaded_exclude.name).lower().endswith(".json"):
+            st.session_state["ui_warnings"].append(
+                "Exclude file looks like JSON (rules). Did you upload the wrong file? Exclude will be ignored."
+            )
+            exclude_path = None
+        else:
+            exclude_path = _save_upload(tmp_dir, uploaded_exclude, name_hint=".exclude")
 
     output_dir = Path(output_dir_text).expanduser()
     return PreparedRun(
@@ -417,6 +429,17 @@ def _write_default_rules_file(tmp_dir: Path) -> Path:
         return target
     target.write_text('{"version": 1, "rules": []}\n', encoding="utf-8")
     return target
+
+
+def _looks_like_json(raw: bytes) -> bool:
+    head = raw.lstrip()[:2]
+    if not head or head[:1] not in (b"{", b"["):
+        return False
+    try:
+        json.loads(raw.decode("utf-8"))
+        return True
+    except Exception:
+        return False
 
 
 if __name__ == "__main__":
