@@ -8,11 +8,10 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from queue import Empty, Queue
-from typing import Iterable, Literal
+from typing import Any, Literal
 
 import streamlit as st
 
-from log_anonymizer.builtin_rules import default_rules, merge_rules
 from log_anonymizer.exclude_filter import ExcludeFilter
 from log_anonymizer.input_handler import handle_input
 from log_anonymizer.processor import ProcessorConfig, process
@@ -93,6 +92,7 @@ def main() -> None:
 
 def _init_state() -> None:
     st.session_state.setdefault("log_queue", Queue())
+    st.session_state.setdefault("outcome_queue", Queue())
     st.session_state.setdefault("log_lines", [])
     st.session_state.setdefault("run_in_progress", False)
     st.session_state.setdefault("run_status", "")
@@ -100,6 +100,8 @@ def _init_state() -> None:
     st.session_state.setdefault("result_zip_bytes", None)
     st.session_state.setdefault("result_zip_name", None)
     st.session_state.setdefault("tmp_dir", None)
+    st.session_state.setdefault("log_handler", None)
+    st.session_state.setdefault("log_prev_handlers", None)
 
 
 def _render_sidebar() -> PreparedRun:
@@ -163,7 +165,7 @@ def _prepare_files(
         input_path = Path(input_path_text).expanduser()
 
     if uploaded_rules is None:
-        rules_path = Path("")
+        rules_path = _write_default_rules_file(tmp_dir)
     else:
         rules_path = _save_upload(tmp_dir, uploaded_rules, name_hint="rules.json")
 
@@ -213,45 +215,56 @@ def _start_run(run: PreparedRun) -> None:
     st.session_state["run_in_progress"] = True
     st.session_state["run_status"] = "Running…"
 
-    q: Queue[str] = st.session_state["log_queue"]
+    log_q: Queue[str] = Queue()
+    outcome_q: Queue[dict[str, Any]] = Queue()
+    st.session_state["log_queue"] = log_q
+    st.session_state["outcome_queue"] = outcome_q
+
     while True:
         try:
-            q.get_nowait()
+            log_q.get_nowait()
+        except Empty:
+            break
+    while True:
+        try:
+            outcome_q.get_nowait()
         except Empty:
             break
 
-    thread = threading.Thread(target=_run_pipeline_thread, args=(run,), daemon=True)
+    handler, prev = _attach_streamlit_logger(log_q, verbose=run.verbose)
+    st.session_state["log_handler"] = handler
+    st.session_state["log_prev_handlers"] = prev
+
+    thread = threading.Thread(
+        target=_run_pipeline_thread, args=(run, log_q, outcome_q), daemon=True
+    )
     thread.start()
 
 
 def _validate_run(run: PreparedRun) -> str | None:
     if not run.input_path or str(run.input_path) == "":
         return "Please provide an input (upload or path)."
-    if not run.rules_path or str(run.rules_path) == "":
-        return "Please upload a rules.json file."
     if not run.output_dir or str(run.output_dir) == "":
         return "Please provide an output directory."
-    if run.input_path.exists() is False and run.input_path.is_absolute():
+    if not run.input_path.exists():
         return f"Input path does not exist: {run.input_path}"
-    # For uploaded files, input_path is absolute and should exist.
-    if run.input_path.is_absolute() and not run.input_path.exists():
-        return f"Uploaded input could not be saved: {run.input_path}"
+    if run.output_dir.exists() and not run.output_dir.is_dir():
+        return f"Output directory is not a directory: {run.output_dir}"
     if not run.rules_path.exists():
-        return f"Rules file does not exist: {run.rules_path}"
+        return f"Rules file could not be created: {run.rules_path}"
     if run.exclude_path is not None and not run.exclude_path.exists():
         return f"Exclude file does not exist: {run.exclude_path}"
     return None
 
 
-def _run_pipeline_thread(run: PreparedRun) -> None:
-    q: Queue[str] = st.session_state["log_queue"]
-    handler, prev = _attach_streamlit_logger(q, verbose=run.verbose)
+def _run_pipeline_thread(
+    run: PreparedRun, log_q: Queue[str], outcome_q: Queue[dict[str, Any]]
+) -> None:
     try:
         if run.dry_run:
             summary = _dry_run(run)
-            q.put(summary)
-            st.session_state["run_status"] = "Dry run completed."
-            st.session_state["run_in_progress"] = False
+            log_q.put(summary)
+            outcome_q.put({"type": "done", "status": "Dry run completed.", "zip_path": None})
             return
 
         cfg = ProcessorConfig(
@@ -267,24 +280,18 @@ def _run_pipeline_thread(run: PreparedRun) -> None:
             config=cfg,
         )
 
-        data = out_zip.read_bytes()
-        st.session_state["result_zip_bytes"] = data
-        st.session_state["result_zip_name"] = out_zip.name
-        st.session_state["run_status"] = f"Completed: {out_zip}"
+        outcome_q.put(
+            {"type": "done", "status": f"Completed: {out_zip}", "zip_path": str(out_zip)}
+        )
     except Exception as exc:  # noqa: BLE001 (UI boundary)
-        st.session_state["run_error"] = f"{type(exc).__name__}: {exc}"
-        st.session_state["run_status"] = "Failed."
-        q.put(f"ERROR: {type(exc).__name__}: {exc}")
-    finally:
-        _detach_streamlit_logger(handler, prev)
-        st.session_state["run_in_progress"] = False
+        log_q.put(f"ERROR: {type(exc).__name__}: {exc}")
+        outcome_q.put(
+            {"type": "error", "status": "Failed.", "error": f"{type(exc).__name__}: {exc}"}
+        )
 
 
 def _dry_run(run: PreparedRun) -> str:
     user_rules = load_rules(run.rules_path)
-    rules = merge_rules(builtin=default_rules(), user=user_rules)
-    if not rules:
-        raise ValueError("No valid rules loaded; nothing to do.")
 
     with handle_input(run.input_path) as prepared:
         base_dir = prepared.working_dir
@@ -302,7 +309,7 @@ def _dry_run(run: PreparedRun) -> str:
         f"- Input: {run.input_path}",
         f"- Output dir: {run.output_dir}",
         f"- Output zip: {zip_path}",
-        f"- Rules: {len(rules)} (user={len(user_rules)}, builtin=on)",
+        f"- User rules loaded: {len(user_rules)} (built-in rules are enabled by default)",
         f"- Files: total={len(files)}, excluded={len(files) - len(filtered)}, to_process={len(filtered)}",
     ]
     preview = [f"  - {p}" for p in filtered[:20]]
@@ -346,6 +353,52 @@ def _pump_logs_once() -> None:
             break
         lines.append(item)
     st.session_state["log_lines"] = lines
+
+    _pump_outcome_once()
+
+
+def _pump_outcome_once() -> None:
+    outcome_q: Queue[dict[str, Any]] = st.session_state["outcome_queue"]
+    while True:
+        try:
+            outcome = outcome_q.get_nowait()
+        except Empty:
+            break
+
+        if outcome.get("type") == "done":
+            st.session_state["run_status"] = str(outcome.get("status") or "Completed.")
+            zip_path = outcome.get("zip_path")
+            if isinstance(zip_path, str) and zip_path:
+                p = Path(zip_path)
+                st.session_state["result_zip_bytes"] = p.read_bytes()
+                st.session_state["result_zip_name"] = p.name
+            st.session_state["run_in_progress"] = False
+            _restore_logger_if_needed()
+        elif outcome.get("type") == "error":
+            st.session_state["run_status"] = str(outcome.get("status") or "Failed.")
+            st.session_state["run_error"] = str(outcome.get("error") or "Unknown error")
+            st.session_state["run_in_progress"] = False
+            _restore_logger_if_needed()
+
+
+def _restore_logger_if_needed() -> None:
+    handler = st.session_state.get("log_handler")
+    prev = st.session_state.get("log_prev_handlers")
+    if handler is not None and prev is not None:
+        _detach_streamlit_logger(handler, prev)
+    st.session_state["log_handler"] = None
+    st.session_state["log_prev_handlers"] = None
+
+
+def _write_default_rules_file(tmp_dir: Path) -> Path:
+    """
+    Create a minimal rules.json file so users can run with built-in rules only.
+    """
+    target = (tmp_dir / "rules.json").resolve()
+    if target.exists():
+        return target
+    target.write_text('{"version": 1, "rules": []}\n', encoding="utf-8")
+    return target
 
 
 if __name__ == "__main__":
