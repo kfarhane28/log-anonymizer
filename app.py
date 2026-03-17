@@ -14,7 +14,7 @@ import streamlit as st
 
 from log_anonymizer.exclude_filter import ExcludeFilter
 from log_anonymizer.input_handler import handle_input
-from log_anonymizer.processor import ProcessorConfig, process
+from log_anonymizer.processor import ProcessorConfig, process_with_result
 from log_anonymizer.rules_loader import load_rules
 
 
@@ -48,6 +48,8 @@ class _QueueHandler(logging.Handler):
 def main() -> None:
     st.set_page_config(page_title="Log Anonymizer", layout="wide")
     _init_state()
+    # Pump queues early so status updates render in the left column.
+    _pump_logs_once()
 
     st.title("Log Anonymizer")
 
@@ -81,7 +83,6 @@ def main() -> None:
         log_box = st.empty()
 
         # Display buffered logs and keep updating while a run is active.
-        _pump_logs_once()
         log_box.code("\n".join(st.session_state["log_lines"][-400:]), language="text")
 
         if st.session_state.get("run_in_progress"):
@@ -272,16 +273,33 @@ def _run_pipeline_thread(
             exclude_case_insensitive=False,
             include_builtin_rules=True,
         )
-        out_zip = process(
+        out_zip = process_with_result(
             input_path=run.input_path,
             rules_path=run.rules_path,
             output_dir=run.output_dir,
             exclude_path=run.exclude_path,
             config=cfg,
         )
-
+        summary = (
+            f"Completed.\n"
+            f"- Output zip: {out_zip.output_zip}\n"
+            f"- Total files: {out_zip.total_files}\n"
+            f"- Excluded: {out_zip.excluded_files}\n"
+            f"- Processed: {out_zip.processed_files}\n"
+            f"- Failed: {out_zip.failed_files}"
+        )
         outcome_q.put(
-            {"type": "done", "status": f"Completed: {out_zip}", "zip_path": str(out_zip)}
+            {
+                "type": "done",
+                "status": summary,
+                "zip_path": str(out_zip.output_zip),
+                "summary": {
+                    "total": out_zip.total_files,
+                    "excluded": out_zip.excluded_files,
+                    "processed": out_zip.processed_files,
+                    "failed": out_zip.failed_files,
+                },
+            }
         )
     except Exception as exc:  # noqa: BLE001 (UI boundary)
         log_q.put(f"ERROR: {type(exc).__name__}: {exc}")

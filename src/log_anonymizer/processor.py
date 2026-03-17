@@ -41,6 +41,25 @@ def process(
     exclude_path: Path | None = None,
     config: ProcessorConfig | None = None,
 ) -> Path:
+    return process_with_result(
+        input_path=input_path,
+        rules_path=rules_path,
+        output_dir=output_dir,
+        output_zip_path=output_zip_path,
+        exclude_path=exclude_path,
+        config=config,
+    ).output_zip
+
+
+def process_with_result(
+    *,
+    input_path: Path,
+    rules_path: Path,
+    output_dir: Path,
+    output_zip_path: Path | None = None,
+    exclude_path: Path | None = None,
+    config: ProcessorConfig | None = None,
+) -> ProcessorResult:
     """
     Main processing pipeline.
 
@@ -58,7 +77,7 @@ def process(
     - Always cleans up temporary directories created during processing
 
     Returns:
-        Path to generated zip file.
+        ProcessorResult including generated zip file path.
     """
     cfg = config or ProcessorConfig()
     out_dir = output_dir.expanduser().resolve()
@@ -121,7 +140,13 @@ def process(
             "total": len(all_files),
         },
     )
-    return out_zip
+    return ProcessorResult(
+        output_zip=out_zip,
+        total_files=len(all_files),
+        processed_files=processed,
+        failed_files=failed,
+        excluded_files=excluded_count,
+    )
 
 
 def _load_exclude_filter(
