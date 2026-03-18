@@ -56,17 +56,17 @@ def main() -> None:
     st.title("Log Anonymizer")
 
     run = _render_sidebar()
-    left, center, right = st.columns([1, 2.6, 1], gap="large")
+    center, right = st.columns([3.8, 1.2], gap="large")
 
-    with left:
-        st.subheader("Execution")
-        bcols = st.columns([1, 3, 1])
-        with bcols[1]:
-            run_clicked = st.button("Run anonymization", type="primary")
+    with center:
+        top = st.columns([1.4, 1.1, 6])
+        run_clicked = top[0].button("Run anonymization", type="primary")
+        clear_clicked = top[1].button(
+            "Clear logs", disabled=st.session_state.get("run_in_progress", False)
+        )
         if run_clicked:
             _start_run(run)
-
-        if st.button("Clear logs", disabled=st.session_state.get("run_in_progress", False)):
+        if clear_clicked:
             st.session_state["log_lines"] = []
             st.session_state["run_error"] = ""
             st.session_state["run_status"] = ""
@@ -75,20 +75,14 @@ def main() -> None:
             st.rerun()
 
         if st.session_state.get("run_status"):
-            st.write(st.session_state["run_status"])
-
+            st.info(st.session_state["run_status"])
         if st.session_state.get("run_error"):
             st.error(st.session_state["run_error"])
 
-        st.caption("Tip: use **Dry run** to preview before generating a zip.")
-
-    with center:
         st.subheader("Logs")
-        log_container = st.container(border=True, height=600)
-
-        # Display buffered logs and keep updating while a run is active.
+        log_container = st.container(border=True, height=760)
         with log_container:
-            st.code("\n".join(st.session_state["log_lines"][-600:]), language="text")
+            st.code("\n".join(st.session_state["log_lines"][-1200:]), language="text")
 
         if st.session_state.get("run_in_progress"):
             st.caption("Updating logs…")
@@ -114,7 +108,9 @@ def main() -> None:
         st.write(f"Verbose: `{run.verbose}`")
         st.write(f"Dry run: `{run.dry_run}`")
         st.write(f"Exclude provided: `{bool(run.exclude_path)}`")
-        st.write(f"Rules file: `{run.rules_path.name if run.rules_path else 'default (built-in only)'}`")
+        st.write(
+            f"Rules file: `{run.rules_path.name if run.rules_path else 'default (built-in only)'}`"
+        )
 
 
 def _init_state() -> None:
