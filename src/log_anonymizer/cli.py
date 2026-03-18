@@ -9,7 +9,7 @@ from typing import NoReturn
 from log_anonymizer.builtin_rules import default_rules, merge_rules
 from log_anonymizer.config.app_config import load_config, resolve_config_path
 from log_anonymizer.config.logging_config import LogFormat, setup_logging
-from log_anonymizer.exclude_filter import ExcludeFilter
+from log_anonymizer.exclude_filter import ExcludeFilter, default_patterns, load_patterns
 from log_anonymizer.input_handler import handle_input
 from log_anonymizer.processor import ProcessorConfig, process
 from log_anonymizer.rules_loader import load_rules
@@ -18,7 +18,7 @@ from log_anonymizer.rules_loader import load_rules
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="log-anonymizer",
-        description="Anonymize Hadoop/Cloudera logs (directory, file, or archive). Writes anonymized logs to an output directory and produces a .tar.gz archive.",
+        description="Anonymize Hadoop/Cloudera logs (directory, file, or archive). Writes a single .tar.gz archive into the output directory.",
     )
     parser.add_argument(
         "--input",
@@ -32,7 +32,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "-o",
         type=Path,
         required=True,
-        help="Output directory for anonymized logs.",
+        help="Output directory where a single .tar.gz archive will be written.",
     )
     parser.add_argument(
         "--rules",
@@ -46,7 +46,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "-x",
         type=Path,
         default=None,
-        help="Optional .exclude file with glob patterns.",
+        help="Optional .exclude file with glob patterns (appended after built-in excludes; use '!pattern' to re-include).",
     )
     parser.add_argument(
         "--config",
@@ -171,16 +171,19 @@ def _dry_run(
     with handle_input(input_path) as prepared:
         base_dir = prepared.working_dir
         files = prepared.files
+        patterns = list(default_patterns())
+        if exclude_path is not None:
+            patterns.extend(load_patterns(exclude_path))
         exclude_filter = (
-            ExcludeFilter.from_file(
-                exclude_path, base_dir=base_dir, case_insensitive=exclude_case_insensitive
+            ExcludeFilter.from_patterns(
+                patterns, base_dir=base_dir, case_insensitive=exclude_case_insensitive
             )
-            if exclude_path is not None
+            if patterns
             else None
         )
         filtered = [f for f in files if not (exclude_filter and exclude_filter.should_exclude(f))]
 
-    zip_path = output_dir.with_suffix(".tar.gz")
+    zip_path = _default_output_archive_path(output_dir, input_path)
     print("DRY RUN")
     print(f"- Input: {input_path}")
     print(f"- Output dir: {output_dir}")
@@ -196,3 +199,18 @@ def _dry_run(
 def _die(message: str) -> "NoReturn":
     print(f"ERROR: {message}", file=sys.stderr)
     raise SystemExit(2)
+
+
+def _default_output_archive_path(output_dir: Path, input_path: Path) -> Path:
+    out_dir = output_dir.resolve()
+    name = input_path.name
+    lower = name.lower()
+    if lower.endswith(".tar.gz"):
+        base = name[: -len(".tar.gz")]
+    elif lower.endswith(".tgz"):
+        base = name[: -len(".tgz")]
+    elif lower.endswith(".zip"):
+        base = input_path.stem
+    else:
+        base = input_path.stem or name
+    return out_dir / f"{base}.tar.gz"

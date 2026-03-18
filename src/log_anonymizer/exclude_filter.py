@@ -9,6 +9,28 @@ from typing import Iterable, Pattern
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_EXCLUDE_PATTERNS: tuple[str, ...] = (
+    # Common credential/key material often present in Hadoop/Cloudera bundles.
+    "creds.localjceks",
+    "creds.localjceks.sha",
+    "*.jceks",
+    "*.jceks.sha",
+    "*.keytab",
+    "krb5.conf",
+    "jaas.conf",
+    "*.jks",
+    "*keystore*",
+    "*truststore*",
+    "*.p12",
+    "*.pfx",
+    "*.pem",
+    "*.key",
+    "*.crt",
+    "*.cer",
+    "*.der",
+    "*.kdb",
+)
+
 
 def load_patterns(exclude_file: Path) -> list[str]:
     """
@@ -44,18 +66,20 @@ class ExcludeFilter:
     base_dir: Path | None = None
     case_insensitive: bool = False
     _compiled: tuple[Pattern[str], ...] = ()
+    _negate: tuple[bool, ...] = ()
 
     @classmethod
     def from_file(
         cls, exclude_file: Path, *, base_dir: Path | None = None, case_insensitive: bool = False
     ) -> "ExcludeFilter":
         patterns = tuple(load_patterns(exclude_file))
-        compiled = tuple(_compile_globs(patterns, case_insensitive=case_insensitive))
+        compiled, negate = _compile_globs(patterns, case_insensitive=case_insensitive)
         return cls(
             patterns=patterns,
             base_dir=base_dir.resolve() if base_dir is not None else None,
             case_insensitive=case_insensitive,
             _compiled=compiled,
+            _negate=negate,
         )
 
     @classmethod
@@ -67,17 +91,23 @@ class ExcludeFilter:
         case_insensitive: bool = False,
     ) -> "ExcludeFilter":
         pat_tuple = tuple(p.strip() for p in patterns if p and p.strip())
-        compiled = tuple(_compile_globs(pat_tuple, case_insensitive=case_insensitive))
+        compiled, negate = _compile_globs(pat_tuple, case_insensitive=case_insensitive)
         return cls(
             patterns=pat_tuple,
             base_dir=base_dir.resolve() if base_dir is not None else None,
             case_insensitive=case_insensitive,
             _compiled=compiled,
+            _negate=negate,
         )
 
     def should_exclude(self, file_path: Path) -> bool:
         """
-        Return True if `file_path` matches any exclude pattern.
+        Return True if `file_path` is excluded by patterns.
+
+        Behavior is gitignore-like:
+        - patterns are evaluated in order
+        - last match wins
+        - patterns starting with '!' re-include (negate)
         """
         abs_posix = file_path.resolve().as_posix()
         basename = file_path.name
@@ -95,21 +125,43 @@ class ExcludeFilter:
         # Also consider a normalized POSIX-ish representation of the provided path.
         candidates.append(str(PurePosixPath(file_path.as_posix())))
 
+        excluded = False
         for idx, rx in enumerate(self._compiled):
             pattern = self.patterns[idx] if idx < len(self.patterns) else "<unknown>"
+            negate = self._negate[idx] if idx < len(self._negate) else False
             for value in candidates:
                 if rx.fullmatch(value):
+                    excluded = not negate
                     logger.debug(
-                        "file_excluded",
-                        extra={"path": abs_posix, "pattern": pattern, "matched": value},
+                        "file_excluded_match",
+                        extra={
+                            "path": abs_posix,
+                            "pattern": pattern,
+                            "matched": value,
+                            "excluded": excluded,
+                        },
                     )
-                    return True
-        return False
+                    break
+        return excluded
 
 
-def _compile_globs(patterns: Iterable[str], *, case_insensitive: bool) -> Iterable[Pattern[str]]:
+def default_patterns() -> tuple[str, ...]:
+    return DEFAULT_EXCLUDE_PATTERNS
+
+
+def _compile_globs(
+    patterns: Iterable[str], *, case_insensitive: bool
+) -> tuple[tuple[Pattern[str], ...], tuple[bool, ...]]:
     flags = re.IGNORECASE if case_insensitive else 0
+    compiled: list[Pattern[str]] = []
+    negate: list[bool] = []
     for pat in patterns:
+        is_negate = pat.startswith("!")
+        candidate = pat[1:] if is_negate else pat
+        if not candidate:
+            continue
         # Translate glob -> regex and compile once for speed on large file lists.
-        rx = fnmatch.translate(pat)
-        yield re.compile(rx, flags=flags)
+        rx = fnmatch.translate(candidate)
+        compiled.append(re.compile(rx, flags=flags))
+        negate.append(is_negate)
+    return tuple(compiled), tuple(negate)

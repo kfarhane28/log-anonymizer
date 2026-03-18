@@ -35,11 +35,13 @@ def test_processor_outputs_tar_gz_and_rules_optional(tmp_path: Path) -> None:
     res = process_with_result(input_path=inp_dir, rules_path=None, output_dir=out_dir)
     assert res.output_zip.exists()
     assert res.output_zip.name.endswith(".tar.gz")
+    assert res.output_zip.parent == out_dir.resolve()
+    assert res.output_zip.name == "in.tar.gz"
 
     with tarfile.open(res.output_zip, mode="r:gz") as tf:
         names = tf.getnames()
     assert "x.log" in names
-    assert (out_dir / "x.log").exists()
+    assert not (out_dir / "x.log").exists()
 
 
 def test_processor_accepts_zip_input_and_outputs_tar_gz(tmp_path: Path) -> None:
@@ -52,6 +54,8 @@ def test_processor_accepts_zip_input_and_outputs_tar_gz(tmp_path: Path) -> None:
     res = process_with_result(input_path=zip_path, rules_path=None, output_dir=out_dir)
     assert res.output_zip.exists()
     assert res.output_zip.name.endswith(".tar.gz")
+    assert res.output_zip.parent == out_dir.resolve()
+    assert res.output_zip.name == "bundle.tar.gz"
 
     with tarfile.open(res.output_zip, mode="r:gz") as tf:
         names = tf.getnames()
@@ -68,10 +72,26 @@ def test_processor_ignores_non_text_in_directory(tmp_path: Path) -> None:
     out_dir = tmp_path / "out"
     res = process_with_result(input_path=inp_dir, rules_path=None, output_dir=out_dir)
 
-    assert (out_dir / "x.log").exists()
+    assert not (out_dir / "x.log").exists()
     assert not (out_dir / "doc.pdf").exists()
+    assert res.output_zip.name == "in.tar.gz"
 
     with tarfile.open(res.output_zip, mode="r:gz") as tf:
         names = tf.getnames()
     assert "x.log" in names
     assert "doc.pdf" not in names
+
+
+def test_processor_excludes_default_sensitive_patterns(tmp_path: Path) -> None:
+    inp_dir = tmp_path / "in"
+    inp_dir.mkdir()
+    (inp_dir / "x.log").write_text("ok\n", encoding="utf-8")
+    (inp_dir / "krb5.conf").write_text("[libdefaults]\n", encoding="utf-8")
+
+    out_dir = tmp_path / "out"
+    res = process_with_result(input_path=inp_dir, rules_path=None, output_dir=out_dir)
+
+    with tarfile.open(res.output_zip, mode="r:gz") as tf:
+        names = tf.getnames()
+    assert "x.log" in names
+    assert "krb5.conf" not in names

@@ -17,7 +17,7 @@ The project ships with a minimal set of built-in rules (IPs, Kerberos principals
 ## Features
 
 - Inputs: directory, single file, `.zip` archive, or `.tar.gz` archive
-- Outputs: anonymized files in an output directory + a `.tar.gz` archive (preserves structure)
+- Outputs: a single `.tar.gz` archive written inside the `--output` directory (preserves structure)
 - `.exclude` support (glob patterns) to exclude sensitive/binary/large artifacts from both processing and output archive
 - Built-in Hadoop-focused redaction rules + optional user-provided rules (`rules.json`)
 - Structured logging (JSON) at `INFO` by default (configurable)
@@ -41,8 +41,7 @@ log-anonymizer \
 ```
 
 Output:
-- anonymized files are written under `tmp_test/out/`
-- the tool generates `tmp_test/out.tar.gz` and prints its path
+- the tool generates `tmp_test/out/in.tar.gz` and prints its path
 
 ## Web UI (Streamlit)
 
@@ -160,6 +159,38 @@ The `.exclude` file is a line-based list of glob patterns.
 - Blank lines and lines starting with `#` are ignored.
 - Patterns are matched against the POSIX-style relative path (with `/` separators).
 - Patterns starting with `!` negate (re-include) a previously excluded match.
+
+### Built-in excludes (default)
+
+Even without `--exclude`, the CLI excludes common credential/key material by default:
+
+```
+creds.localjceks
+creds.localjceks.sha
+*.jceks
+*.jceks.sha
+*.keytab
+krb5.conf
+jaas.conf
+*.jks
+*keystore*
+*truststore*
+*.p12
+*.pfx
+*.pem
+*.key
+*.crt
+*.cer
+*.der
+*.kdb
+```
+
+If you pass `--exclude path/to/.exclude`, its patterns are appended after the built-ins (so your file can override defaults using `!`):
+
+```
+!**/krb5.conf
+**/*.parquet
+```
 
 See `examples/.exclude`.
 

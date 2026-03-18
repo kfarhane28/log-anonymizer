@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import logging
+import shutil
 import tarfile
+import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -9,7 +11,7 @@ from typing import Iterable
 
 from log_anonymizer.anonymizer import AnonymizeFileStats, anonymize_file
 from log_anonymizer.builtin_rules import default_rules, merge_rules
-from log_anonymizer.exclude_filter import ExcludeFilter
+from log_anonymizer.exclude_filter import ExcludeFilter, default_patterns, load_patterns
 from log_anonymizer.input_handler import handle_input
 from log_anonymizer.rules_loader import Rule, load_rules
 
@@ -69,8 +71,8 @@ def process_with_result(
     3) Load rules
     4) Filter files
     5) Process each file with anonymizer (parallel)
-    6) Write results to output directory
-    7) Compress output directory into a tar.gz archive
+    6) Write results to a temporary directory
+    7) Compress the temporary directory into a tar.gz archive in `output_dir`
 
     Robustness:
     - Continues on per-file errors (logs and skips failing files)
@@ -80,12 +82,12 @@ def process_with_result(
         ProcessorResult including generated archive file path.
     """
     cfg = config or ProcessorConfig()
-    out_dir = output_dir.expanduser().resolve()
-    if out_dir.exists() and not out_dir.is_dir():
-        raise ValueError(f"--output must be a directory: {out_dir}")
-    out_dir.mkdir(parents=True, exist_ok=True)
+    output_root = output_dir.expanduser().resolve()
+    if output_root.exists() and not output_root.is_dir():
+        raise ValueError(f"--output must be a directory: {output_root}")
+    output_root.mkdir(parents=True, exist_ok=True)
 
-    out_zip = _resolve_output_archive_path(out_dir, output_zip_path)
+    out_zip = _resolve_output_archive_path(output_root, input_path, output_zip_path)
     out_zip.parent.mkdir(parents=True, exist_ok=True)
 
     user_rules = load_rules(rules_path) if rules_path is not None else []
@@ -97,38 +99,42 @@ def process_with_result(
     if not rules:
         raise ValueError("No valid rules loaded; refusing to process.")
 
-    with handle_input(input_path) as prepared:
-        working_dir = prepared.working_dir
-        all_files = prepared.files
-        logger.info(
-            "pipeline_input_ready",
-            extra={"working_dir": str(working_dir), "files": len(all_files)},
-        )
+    tmp_out_dir = Path(tempfile.mkdtemp(prefix="log-anonymizer-out-")).resolve()
+    try:
+        with handle_input(input_path) as prepared:
+            working_dir = prepared.working_dir
+            all_files = prepared.files
+            logger.info(
+                "pipeline_input_ready",
+                extra={"working_dir": str(working_dir), "files": len(all_files)},
+            )
 
-        exclude_filter = _load_exclude_filter(
-            exclude_path, base_dir=working_dir, case_insensitive=cfg.exclude_case_insensitive
-        )
-        files = _filter_files(all_files, exclude_filter)
+            exclude_filter = _load_exclude_filter(
+                exclude_path, base_dir=working_dir, case_insensitive=cfg.exclude_case_insensitive
+            )
+            files = _filter_files(all_files, exclude_filter)
 
-        excluded_count = len(all_files) - len(files)
-        logger.info(
-            "pipeline_files_filtered",
-            extra={"to_process": len(files), "excluded": excluded_count, "total": len(all_files)},
-        )
+            excluded_count = len(all_files) - len(files)
+            logger.info(
+                "pipeline_files_filtered",
+                extra={"to_process": len(files), "excluded": excluded_count, "total": len(all_files)},
+            )
 
-        processed, failed = _process_files_parallel(
-            files=files,
-            working_dir=working_dir,
-            output_dir=out_dir,
-            rules=rules,
-            max_workers=cfg.max_workers,
-        )
-        _tar_gz_dir(out_dir, out_zip)
+            processed, failed = _process_files_parallel(
+                files=files,
+                working_dir=working_dir,
+                output_dir=tmp_out_dir,
+                rules=rules,
+                max_workers=cfg.max_workers,
+            )
+            _tar_gz_dir(tmp_out_dir, out_zip)
+    finally:
+        shutil.rmtree(tmp_out_dir, ignore_errors=True)
 
     logger.info(
         "pipeline_done",
         extra={
-            "output_dir": str(out_dir),
+            "output_dir": str(output_root),
             "output_zip": str(out_zip),
             "processed": processed,
             "failed": failed,
@@ -148,13 +154,18 @@ def process_with_result(
 def _load_exclude_filter(
     exclude_path: Path | None, *, base_dir: Path, case_insensitive: bool
 ) -> ExcludeFilter | None:
-    if exclude_path is None:
+    patterns: list[str] = list(default_patterns())
+    if exclude_path is not None:
+        p = exclude_path.expanduser().resolve()
+        if not p.exists():
+            raise FileNotFoundError(p)
+        logger.info("exclude_loaded", extra={"path": str(p)})
+        patterns.extend(load_patterns(p))
+    if not patterns:
         return None
-    p = exclude_path.expanduser().resolve()
-    if not p.exists():
-        raise FileNotFoundError(p)
-    logger.info("exclude_loaded", extra={"path": str(p)})
-    return ExcludeFilter.from_file(p, base_dir=base_dir, case_insensitive=case_insensitive)
+    return ExcludeFilter.from_patterns(
+        patterns, base_dir=base_dir, case_insensitive=case_insensitive
+    )
 
 
 def _filter_files(files: Iterable[Path], exclude_filter: ExcludeFilter | None) -> list[Path]:
@@ -227,20 +238,36 @@ def _is_tar_gz_path(path: Path) -> bool:
     return name.endswith(".tar.gz") or name.endswith(".tgz")
 
 
-def _resolve_output_archive_path(output_dir: Path, output_zip_path: Path | None) -> Path:
+def _resolve_output_archive_path(output_dir: Path, input_path: Path, output_zip_path: Path | None) -> Path:
     """
-    Resolve the output archive path (tar.gz).
-
-    Notes:
-        The parameter name `output_zip_path` is kept for backward compatibility,
-        but the tool now produces `.tar.gz` archives.
+    Resolve the output archive path (tar.gz) such that the CLI output is a single archive
+    inside `output_dir`.
     """
+    output_dir = output_dir.resolve()
     if output_zip_path is None:
-        return output_dir.with_suffix(".tar.gz")
+        base = _archive_base_name(input_path)
+        return (output_dir / f"{base}.tar.gz").resolve()
+
     out = output_zip_path.expanduser().resolve()
     if not _is_tar_gz_path(out):
         raise ValueError(f"Output archive must end with .tar.gz or .tgz: {out}")
+    if output_dir != out.parent and output_dir not in out.parents:
+        raise ValueError(f"Output archive must be inside --output directory: {out}")
     return out
+
+
+def _archive_base_name(input_path: Path) -> str:
+    p = input_path.expanduser()
+    name = p.name
+    lower = name.lower()
+    if lower.endswith(".tar.gz"):
+        return name[: -len(".tar.gz")]
+    if lower.endswith(".tgz"):
+        return name[: -len(".tgz")]
+    if lower.endswith(".zip"):
+        return p.stem
+    # For directories or plain files, stem is a reasonable base.
+    return p.stem or name
 
 
 def _tar_gz_dir(root_dir: Path, out_tar_gz: Path) -> None:

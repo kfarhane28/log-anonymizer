@@ -17,7 +17,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 import pandas as pd
 
-from log_anonymizer.exclude_filter import ExcludeFilter
+from log_anonymizer.exclude_filter import ExcludeFilter, default_patterns
 from log_anonymizer.input_handler import handle_input
 from log_anonymizer.exclude_filter import load_patterns as _load_exclude_patterns
 from log_anonymizer.application.preview_anonymization import (
@@ -442,18 +442,34 @@ def _dry_run(run: PreparedRun) -> str:
     with handle_input(run.input_path) as prepared:
         base_dir = prepared.working_dir
         files = prepared.files
+        patterns = list(default_patterns())
+        if run.exclude_path is not None:
+            patterns.extend(_load_exclude_patterns(run.exclude_path))
         exclude_filter = (
-            ExcludeFilter.from_file(run.exclude_path, base_dir=base_dir, case_insensitive=False)
-            if run.exclude_path is not None
+            ExcludeFilter.from_patterns(patterns, base_dir=base_dir, case_insensitive=False)
+            if patterns
             else None
         )
         filtered = [f for f in files if not (exclude_filter and exclude_filter.should_exclude(f))]
 
-    zip_path = run.output_dir.expanduser().resolve().with_suffix(".tar.gz")
-    exclude_info = "none"
+    name = run.input_path.name
+    lower = name.lower()
+    if lower.endswith(".tar.gz"):
+        base = name[: -len(".tar.gz")]
+    elif lower.endswith(".tgz"):
+        base = name[: -len(".tgz")]
+    elif lower.endswith(".zip"):
+        base = run.input_path.stem
+    else:
+        base = run.input_path.stem or name
+    zip_path = run.output_dir.expanduser().resolve() / f"{base}.tar.gz"
+    exclude_info = f"builtin={len(default_patterns())}"
     if run.exclude_path is not None:
         try:
-            exclude_info = f"{run.exclude_path} ({len(_load_exclude_patterns(run.exclude_path))} patterns)"
+            exclude_info = (
+                f"{run.exclude_path} (builtin={len(default_patterns())}, "
+                f"user={len(_load_exclude_patterns(run.exclude_path))})"
+            )
         except Exception:
             exclude_info = str(run.exclude_path)
     lines = [
@@ -546,15 +562,12 @@ def _restore_logger_if_needed() -> None:
 def _render_preview_tab(run: PreparedRun) -> None:
     st.caption("Paste a few log lines to preview anonymization (in-memory; no files written).")
 
+    status_slot = st.container()
+
     text_in = st.session_state.get("preview_input") or ""
     text_out = st.session_state.get("preview_output_value") or ""
     lines_in = len(text_in.splitlines()) if text_in else 0
     lines_out = len(text_out.splitlines()) if text_out else 0
-
-    if st.session_state.get("preview_status"):
-        st.success(st.session_state["preview_status"])
-    if st.session_state.get("preview_error"):
-        st.error(st.session_state["preview_error"])
 
     b1, b2, _ = st.columns([1.2, 1.0, 6])
     anonymize_clicked = b1.button(
@@ -599,6 +612,12 @@ def _render_preview_tab(run: PreparedRun) -> None:
         st.session_state["preview_status"] = ""
         st.session_state["preview_error"] = ""
         st.rerun()
+
+    with status_slot:
+        if st.session_state.get("preview_status"):
+            st.success(st.session_state["preview_status"])
+        if st.session_state.get("preview_error"):
+            st.error(st.session_state["preview_error"])
 
     st.text_area(
         "Input (raw logs)",
