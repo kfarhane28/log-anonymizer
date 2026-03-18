@@ -1,14 +1,27 @@
-# log-anonymizer
+<p align="center">
+  <img src="assets/logo.svg" width="96" alt="Log Anonymizer logo" />
+</p>
 
-Production-ready CLI tool to anonymize Hadoop/Cloudera logs (HDFS, YARN, Hive, Spark, Impala, etc.) using configurable regex rules.
+<h1 align="center">Log Anonymizer</h1>
+
+<p align="center">
+  <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/License-Apache%202.0-blue.svg"></a>
+  <img alt="Python" src="https://img.shields.io/badge/python-3.10%2B-informational">
+  <img alt="UI" src="https://img.shields.io/badge/UI-Streamlit-ff4b4b">
+</p>
+
+Production-ready CLI + Streamlit UI to redact/anonymize Hadoop ecosystem logs (HDFS, YARN, Hive, Spark, Impala, etc.) before sharing support bundles.
+
+The project ships with sensible built-in rules (IPs, hostnames, Kerberos principals, usernames, common paths) and lets you add your own rules and exclude patterns.
 
 ## Features
 
-- Accepts input as a directory, a single file, or a `.zip` archive
-- Produces a `.zip` archive with anonymized logs (preserves folder structure)
-- `.exclude` support (glob patterns) to skip files you don't want to ship (e.g., binaries, archives, huge traces)
-- Deterministic anonymization via salted hashing (so repeated identifiers map to the same anonymized token)
-- Structured logging (JSON) at INFO by default
+- Inputs: directory, single file, or `.zip` archive
+- Outputs: anonymized files in an output directory + a `.zip` archive (preserves structure)
+- `.exclude` support (glob patterns) to exclude sensitive/binary/large artifacts from both processing and output zip
+- Built-in Hadoop-focused redaction rules + user-provided rules (`rules.json`)
+- Structured logging (JSON) at `INFO` by default (configurable)
+- Streams large files line-by-line (memory efficient); skips likely-binary files
 
 ## Install
 
@@ -19,6 +32,20 @@ pip install -r requirements.txt
 pip install -e .
 ```
 
+## Quick start (CLI)
+
+```bash
+log-anonymizer \
+  --input tmp_test/in \
+  --output tmp_test/out \
+  --rules examples/rules.json \
+  --exclude examples/.exclude
+```
+
+Output:
+- anonymized files are written under `tmp_test/out/`
+- the tool generates `tmp_test/out.zip` and prints its path
+
 ## Web UI (Streamlit)
 
 Launch the web UI:
@@ -28,52 +55,94 @@ source .venv/bin/activate
 streamlit run app.py
 ```
 
-The UI exposes the same options as the CLI:
-- input: upload file/zip or provide a path
-- rules: upload JSON
-- exclude: upload `.exclude`
-- output directory
-- verbose / dry-run
+The UI exposes the same options as the CLI, plus:
+- live logs
+- download button for the resulting zip
+- editable **Rules** and **Exclude** tabs (view/modify uploaded content interactively)
 
-## Quick start
+## Usage
 
-### 1) Anonymize a directory of logs
+### CLI examples
 
 ```bash
-log-anonymizer /path/to/logs \
+log-anonymizer --help
+```
+
+Anonymize a directory:
+
+```bash
+log-anonymizer \
+  --input /path/to/logs \
+  --output anonymized-out \
+  --rules examples/rules.json \
+  --exclude examples/.exclude
+```
+
+Anonymize a single file:
+
+```bash
+log-anonymizer \
+  --input /path/to/hadoop.log \
+  --output anonymized-out \
+  --rules examples/rules.json
+```
+
+Anonymize a zip support bundle:
+
+```bash
+log-anonymizer \
+  --input /path/to/support-bundle.zip \
+  --output anonymized-out \
+  --rules examples/rules.json \
+  --exclude examples/.exclude
+```
+
+### Dry-run
+
+Preview which files will be processed, and how rules/exclude will be applied:
+
+```bash
+log-anonymizer \
+  --input /path/to/support-bundle.zip \
+  --output anonymized-out \
   --rules examples/rules.json \
   --exclude examples/.exclude \
-  --output anonymized-logs.zip
+  --dry-run
 ```
 
-### 2) Anonymize a single file
+## Configuration
 
-```bash
-log-anonymizer /path/to/hadoop.log \
-  --rules examples/rules.json \
-  --output anonymized.zip
+Default logging configuration can be set via `log-anonymizer.ini` (or `--config`, or `$LOG_ANONYMIZER_CONFIG`):
+
+```ini
+[logging]
+level = INFO
+format = json
 ```
 
-### 3) Anonymize a zip of logs
+## Rules file (`rules.json`)
 
-```bash
-log-anonymizer /path/to/support-bundle.zip \
-  --rules examples/rules.json \
-  --exclude examples/.exclude \
-  --output anonymized-support-bundle.zip
+User rules are applied in addition to built-in rules. File format:
+
+```json
+{
+  "version": 1,
+  "rules": [
+    {
+      "description": "Bearer token",
+      "trigger": "Bearer ",
+      "search": "(?i)\\bBearer\\s+\\S+\\b",
+      "replace": "Bearer [REDACTED]",
+      "caseSensitive": "false"
+    }
+  ]
+}
 ```
 
-## Rules format
-
-Rules are loaded from JSON and applied sequentially to each line.
-
-Supported actions:
-- `hash`: replace each match with a deterministic hash token (recommended)
-- `mask`: replace each match with `*` of the same length
-- `token`: replace each match with a fixed token string (e.g., `[REDACTED]`)
-- `replace`: replace using a `re.sub` replacement string (supports capture groups)
-
-See `examples/rules.json`.
+Notes:
+- `trigger` is a fast substring pre-check (rule runs only if the trigger is present in the line).
+- `search` is a Python regex, `replace` is passed to `re.sub`.
+- `caseSensitive` defaults to `true` if omitted.
 
 ## `.exclude` format
 
@@ -85,18 +154,22 @@ The `.exclude` file is a line-based list of glob patterns.
 
 See `examples/.exclude`.
 
-## CLI reference
+## Development
+
+Run tests:
 
 ```bash
-log-anonymizer --help
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements-dev.txt
+pytest -q
 ```
-
-Common options:
-- `--salt`: controls hashing stability. If omitted, a random salt is generated and logged once; provide one to make runs reproducible across environments.
-- `--log-format`: `json` (default) or `text`
-- `--log-level`: `INFO` (default), `DEBUG`, `WARNING`, ...
 
 ## Notes
 
 - This tool processes files as text; it attempts UTF-8 decoding first and falls back to Latin-1.
 - It streams line-by-line to handle large log files.
+
+## License
+
+Apache License 2.0. See `LICENSE`.
