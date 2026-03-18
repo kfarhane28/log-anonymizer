@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import os
 import base64
@@ -13,6 +14,7 @@ from queue import Empty, Queue
 from typing import Any, Literal
 
 import streamlit as st
+import pandas as pd
 
 from log_anonymizer.exclude_filter import ExcludeFilter
 from log_anonymizer.input_handler import handle_input
@@ -102,15 +104,23 @@ def main() -> None:
         if st.session_state.get("run_error"):
             st.error(st.session_state["run_error"])
 
-        st.subheader("Logs")
-        log_container = st.container(border=True, height=760)
-        with log_container:
-            st.code("\n".join(st.session_state["log_lines"][-1200:]), language="text")
+        logs_tab, rules_tab, exclude_tab = st.tabs(["Logs", "Rules", "Exclude"])
 
-        if st.session_state.get("run_in_progress"):
-            st.caption("Updating logs…")
-            time.sleep(0.25)
-            st.rerun()
+        with logs_tab:
+            log_container = st.container(border=True, height=760)
+            with log_container:
+                st.code("\n".join(st.session_state["log_lines"][-1200:]), language="text")
+
+            if st.session_state.get("run_in_progress"):
+                st.caption("Updating logs…")
+                time.sleep(0.25)
+                st.rerun()
+
+        with rules_tab:
+            _render_rules_editor()
+
+        with exclude_tab:
+            _render_exclude_editor()
 
     with right:
         st.subheader("Output")
@@ -150,6 +160,10 @@ def _init_state() -> None:
     st.session_state.setdefault("log_prev_handlers", None)
     st.session_state.setdefault("ui_warnings", [])
     st.session_state.setdefault("ui_errors", [])
+    st.session_state.setdefault("rules_editor_df", None)
+    st.session_state.setdefault("exclude_editor_df", None)
+    st.session_state.setdefault("rules_upload_sig", None)
+    st.session_state.setdefault("exclude_upload_sig", None)
 
 
 def _render_sidebar() -> PreparedRun:
@@ -172,8 +186,10 @@ def _render_sidebar() -> PreparedRun:
     else:
         input_path_text = st.sidebar.text_input("Input path", value="tmp_test/in")
 
-    uploaded_rules = st.sidebar.file_uploader("Rules JSON", type=["json"])
-    uploaded_exclude = st.sidebar.file_uploader("Exclude file (.exclude)", type=None)
+    uploaded_rules = st.sidebar.file_uploader("Rules JSON", type=["json"], key="rules_upload")
+    uploaded_exclude = st.sidebar.file_uploader(
+        "Exclude file (.exclude)", type=None, key="exclude_upload"
+    )
 
     output_dir_text = st.sidebar.text_input("Output directory", value="tmp_test/ui_out")
     verbose = st.sidebar.checkbox("Verbose mode (DEBUG)", value=False)
@@ -221,15 +237,18 @@ def _prepare_files(
         input_path = Path(input_path_text).expanduser()
 
     if uploaded_rules is None:
-        rules_path = _write_default_rules_file(tmp_dir)
+        _ensure_rules_editor_initialized()
+        rules_path = _write_rules_from_editor(tmp_dir)
     else:
         raw = bytes(uploaded_rules.getbuffer())
         err = _validate_rules_json_bytes(raw)
         if err:
             st.session_state["ui_errors"].append(f"Rules JSON invalid: {err}")
-            rules_path = _write_default_rules_file(tmp_dir)
+            _ensure_rules_editor_initialized()
+            rules_path = _write_rules_from_editor(tmp_dir)
         else:
-            rules_path = _save_upload(tmp_dir, uploaded_rules, name_hint="rules.json")
+            _maybe_load_rules_upload_into_editor(raw, name=str(uploaded_rules.name))
+            rules_path = _write_rules_from_editor(tmp_dir)
 
     exclude_path = None
     if uploaded_exclude is not None:
@@ -239,7 +258,11 @@ def _prepare_files(
             st.session_state["ui_errors"].append(f"Exclude file invalid: {err}")
             exclude_path = None
         else:
-            exclude_path = _save_upload(tmp_dir, uploaded_exclude, name_hint=".exclude")
+            _maybe_load_exclude_upload_into_editor(raw, name=str(uploaded_exclude.name))
+            exclude_path = _write_exclude_from_editor(tmp_dir)
+    else:
+        if _exclude_editor_has_patterns():
+            exclude_path = _write_exclude_from_editor(tmp_dir)
 
     output_dir = Path(output_dir_text).expanduser()
     return PreparedRun(
@@ -494,6 +517,247 @@ def _write_default_rules_file(tmp_dir: Path) -> Path:
         return target
     target.write_text('{"version": 1, "rules": []}\n', encoding="utf-8")
     return target
+
+
+def _ensure_rules_editor_initialized() -> None:
+    if st.session_state.get("rules_editor_df") is not None:
+        return
+    st.session_state["rules_editor_df"] = pd.DataFrame(
+        columns=["description", "trigger", "search", "replace", "caseSensitive"]
+    )
+
+
+def _ensure_exclude_editor_initialized() -> None:
+    if st.session_state.get("exclude_editor_df") is not None:
+        return
+    st.session_state["exclude_editor_df"] = pd.DataFrame(columns=["pattern"])
+
+
+def _sig(name: str, raw: bytes) -> str:
+    h = hashlib.sha256()
+    h.update(name.encode("utf-8", errors="ignore"))
+    h.update(b"\x00")
+    h.update(raw[:65536])
+    return h.hexdigest()
+
+
+def _rules_df_to_json_bytes(df: "pd.DataFrame") -> bytes:
+    rules: list[dict[str, Any]] = []
+    for _, row in df.iterrows():
+        description = str(row.get("description") or "").strip()
+        trigger = str(row.get("trigger") or "").strip()
+        search = str(row.get("search") or "").strip()
+        replace = str(row.get("replace") or "")
+        case_sensitive = row.get("caseSensitive")
+
+        if not trigger and not search and replace == "" and not description:
+            continue
+
+        rule: dict[str, Any] = {
+            "description": description,
+            "trigger": trigger,
+            "search": search,
+            "replace": replace,
+        }
+        if case_sensitive is not None and str(case_sensitive).strip() != "":
+            rule["caseSensitive"] = case_sensitive
+        rules.append(rule)
+
+    payload = {"version": 1, "rules": rules}
+    return (json.dumps(payload, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+
+
+def _write_rules_from_editor(tmp_dir: Path) -> Path:
+    _ensure_rules_editor_initialized()
+    df = st.session_state["rules_editor_df"]
+    raw = _rules_df_to_json_bytes(df)
+    err = _validate_rules_json_bytes(raw)
+    if err:
+        st.session_state["ui_errors"].append(f"Rules editor invalid: {err}")
+        raw = b'{"version": 1, "rules": []}\n'
+    target = (tmp_dir / "rules.json").resolve()
+    target.write_bytes(raw)
+    return target
+
+
+def _exclude_df_to_text(df: "pd.DataFrame") -> str:
+    patterns: list[str] = []
+    for _, row in df.iterrows():
+        p = str(row.get("pattern") or "").strip()
+        if not p or p.startswith("#"):
+            continue
+        patterns.append(p)
+    return "\n".join(patterns) + ("\n" if patterns else "")
+
+
+def _exclude_editor_has_patterns() -> bool:
+    _ensure_exclude_editor_initialized()
+    df = st.session_state["exclude_editor_df"]
+    if df is None or df.empty:
+        return False
+    for _, row in df.iterrows():
+        p = str(row.get("pattern") or "").strip()
+        if p and not p.startswith("#"):
+            return True
+    return False
+
+
+def _write_exclude_from_editor(tmp_dir: Path) -> Path | None:
+    _ensure_exclude_editor_initialized()
+    df = st.session_state["exclude_editor_df"]
+    text = _exclude_df_to_text(df)
+    raw = text.encode("utf-8")
+    err = _validate_exclude_bytes(raw, filename=".exclude")
+    if err:
+        st.session_state["ui_errors"].append(f"Exclude editor invalid: {err}")
+        return None
+    target = (tmp_dir / ".exclude").resolve()
+    target.write_bytes(raw)
+    return target
+
+
+def _maybe_load_rules_upload_into_editor(raw: bytes, *, name: str) -> None:
+    sig = _sig(name, raw)
+    if st.session_state.get("rules_upload_sig") == sig:
+        return
+    st.session_state["rules_upload_sig"] = sig
+
+    try:
+        obj = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return
+    rules = obj.get("rules") if isinstance(obj, dict) else None
+    if not isinstance(rules, list):
+        return
+
+    rows: list[dict[str, Any]] = []
+    for r in rules:
+        if not isinstance(r, dict):
+            continue
+        rows.append(
+            {
+                "description": r.get("description", ""),
+                "trigger": r.get("trigger", ""),
+                "search": r.get("search", ""),
+                "replace": r.get("replace", ""),
+                "caseSensitive": r.get("caseSensitive", ""),
+            }
+        )
+    st.session_state["rules_editor_df"] = pd.DataFrame(
+        rows, columns=["description", "trigger", "search", "replace", "caseSensitive"]
+    )
+
+
+def _maybe_load_exclude_upload_into_editor(raw: bytes, *, name: str) -> None:
+    sig = _sig(name, raw)
+    if st.session_state.get("exclude_upload_sig") == sig:
+        return
+    st.session_state["exclude_upload_sig"] = sig
+
+    try:
+        text = raw.decode("utf-8")
+    except Exception:
+        return
+    patterns: list[dict[str, Any]] = []
+    for line in text.splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        patterns.append({"pattern": s})
+    st.session_state["exclude_editor_df"] = pd.DataFrame(patterns, columns=["pattern"])
+
+
+def _render_rules_editor() -> None:
+    _ensure_rules_editor_initialized()
+    st.caption("Edit rules that will be applied in addition to built-in rules.")
+
+    b1, b2, _ = st.columns([1.2, 1.2, 6])
+    if b1.button("Add rule", key="add_rule"):
+        df = st.session_state["rules_editor_df"]
+        df = pd.concat(
+            [
+                df,
+                pd.DataFrame(
+                    [
+                        {
+                            "description": "",
+                            "trigger": "",
+                            "search": "",
+                            "replace": "",
+                            "caseSensitive": "",
+                        }
+                    ]
+                ),
+            ],
+            ignore_index=True,
+        )
+        st.session_state["rules_editor_df"] = df
+        st.rerun()
+    if b2.button("Reset rules", key="reset_rules"):
+        st.session_state["rules_editor_df"] = pd.DataFrame(
+            columns=["description", "trigger", "search", "replace", "caseSensitive"]
+        )
+        st.rerun()
+
+    edited = st.data_editor(
+        st.session_state["rules_editor_df"],
+        key="rules_editor",
+        num_rows="dynamic",
+        use_container_width=True,
+        column_config={
+            "description": st.column_config.TextColumn("description"),
+            "trigger": st.column_config.TextColumn("trigger"),
+            "search": st.column_config.TextColumn("search (regex)"),
+            "replace": st.column_config.TextColumn("replace"),
+            "caseSensitive": st.column_config.TextColumn("caseSensitive"),
+        },
+    )
+    st.session_state["rules_editor_df"] = edited
+
+    raw = _rules_df_to_json_bytes(edited)
+    err = _validate_rules_json_bytes(raw)
+    if err:
+        st.error(f"Rules validation error: {err}")
+    else:
+        st.success("Rules look valid.")
+
+    st.subheader("Preview")
+    st.code(raw.decode("utf-8"), language="json")
+
+
+def _render_exclude_editor() -> None:
+    _ensure_exclude_editor_initialized()
+    st.caption("Edit exclude patterns (glob style).")
+
+    b1, b2, _ = st.columns([1.3, 1.3, 6])
+    if b1.button("Add pattern", key="add_pattern"):
+        df = st.session_state["exclude_editor_df"]
+        df = pd.concat([df, pd.DataFrame([{"pattern": ""}])], ignore_index=True)
+        st.session_state["exclude_editor_df"] = df
+        st.rerun()
+    if b2.button("Reset exclude", key="reset_exclude"):
+        st.session_state["exclude_editor_df"] = pd.DataFrame(columns=["pattern"])
+        st.rerun()
+
+    edited = st.data_editor(
+        st.session_state["exclude_editor_df"],
+        key="exclude_editor",
+        num_rows="dynamic",
+        use_container_width=True,
+        column_config={"pattern": st.column_config.TextColumn("pattern")},
+    )
+    st.session_state["exclude_editor_df"] = edited
+
+    text = _exclude_df_to_text(edited)
+    raw = text.encode("utf-8")
+    err = _validate_exclude_bytes(raw, filename=".exclude")
+    if err:
+        st.error(f"Exclude validation error: {err}")
+    else:
+        st.success("Exclude file looks valid.")
+
+    st.subheader("Preview")
+    st.code(text or "# (no exclude patterns)\n", language="text")
 
 
 def _looks_like_json(raw: bytes) -> bool:
