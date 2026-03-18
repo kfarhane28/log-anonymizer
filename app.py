@@ -59,10 +59,10 @@ def main() -> None:
     center, right = st.columns([3.8, 1.2], gap="large")
 
     with center:
-        top = st.columns([1.4, 1.1, 6])
+        top = st.columns([1.2, 1.2, 8])
         run_clicked = top[0].button("Run", type="primary")
         clear_clicked = top[1].button(
-            "Clear logs", disabled=st.session_state.get("run_in_progress", False)
+            "Clear log", disabled=st.session_state.get("run_in_progress", False)
         )
         if run_clicked:
             _start_run(run)
