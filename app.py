@@ -56,41 +56,65 @@ def main() -> None:
     st.title("Log Anonymizer")
 
     run = _render_sidebar()
-    left, right = st.columns([1, 1])
+    left, center, right = st.columns([1, 2.6, 1], gap="large")
 
     with left:
         st.subheader("Execution")
-        run_clicked = st.button("Run Anonymization", type="primary", use_container_width=True)
+        bcols = st.columns([1, 3, 1])
+        with bcols[1]:
+            run_clicked = st.button("Run anonymization", type="primary")
         if run_clicked:
             _start_run(run)
+
+        if st.button("Clear logs", disabled=st.session_state.get("run_in_progress", False)):
+            st.session_state["log_lines"] = []
+            st.session_state["run_error"] = ""
+            st.session_state["run_status"] = ""
+            st.session_state["result_zip_bytes"] = None
+            st.session_state["result_zip_name"] = None
+            st.rerun()
 
         if st.session_state.get("run_status"):
             st.write(st.session_state["run_status"])
 
+        if st.session_state.get("run_error"):
+            st.error(st.session_state["run_error"])
+
+        st.caption("Tip: use **Dry run** to preview before generating a zip.")
+
+    with center:
+        st.subheader("Logs")
+        log_container = st.container(border=True, height=600)
+
+        # Display buffered logs and keep updating while a run is active.
+        with log_container:
+            st.code("\n".join(st.session_state["log_lines"][-600:]), language="text")
+
+        if st.session_state.get("run_in_progress"):
+            st.caption("Updating logs…")
+            time.sleep(0.25)
+            st.rerun()
+
+    with right:
+        st.subheader("Output")
+        st.write(f"Output directory: `{run.output_dir}`")
+        st.write(f"Output zip: `{run.output_dir.with_suffix('.zip')}`")
+
         if st.session_state.get("result_zip_bytes") is not None:
-            st.success("Anonymization finished successfully.")
+            st.success("Done.")
             st.download_button(
-                "Download anonymized zip",
+                "Download zip",
                 data=st.session_state["result_zip_bytes"],
                 file_name=st.session_state.get("result_zip_name", "anonymized.zip"),
                 mime="application/zip",
                 use_container_width=True,
             )
 
-        if st.session_state.get("run_error"):
-            st.error(st.session_state["run_error"])
-
-    with right:
-        st.subheader("Logs")
-        log_box = st.empty()
-
-        # Display buffered logs and keep updating while a run is active.
-        log_box.code("\n".join(st.session_state["log_lines"][-400:]), language="text")
-
-        if st.session_state.get("run_in_progress"):
-            st.caption("Updating logs…")
-            time.sleep(0.25)
-            st.rerun()
+        st.subheader("Run")
+        st.write(f"Verbose: `{run.verbose}`")
+        st.write(f"Dry run: `{run.dry_run}`")
+        st.write(f"Exclude provided: `{bool(run.exclude_path)}`")
+        st.write(f"Rules file: `{run.rules_path.name if run.rules_path else 'default (built-in only)'}`")
 
 
 def _init_state() -> None:
