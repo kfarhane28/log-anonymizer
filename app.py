@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import base64
 import tempfile
 import threading
 import time
@@ -47,19 +48,41 @@ class _QueueHandler(logging.Handler):
             pass
 
 
+def _render_header() -> None:
+    logo_path = Path(__file__).resolve().parent / "assets" / "logo.svg"
+    svg = logo_path.read_text(encoding="utf-8")
+    b64 = base64.b64encode(svg.encode("utf-8")).decode("ascii")
+    html = f"""
+    <div style="display:flex; align-items:center; gap:12px; margin: 4px 0 8px 0;">
+      <img src="data:image/svg+xml;base64,{b64}" width="36" height="36" />
+      <div style="font-size: 34px; font-weight: 700; line-height: 1.0;">Log Anonymizer</div>
+    </div>
+    """
+    st.markdown(html, unsafe_allow_html=True)
+    st.markdown(
+        """
+        <style>
+          /* Avoid button label wrapping (e.g., "Clear log" splitting on 2 lines). */
+          div.stButton > button { white-space: nowrap; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def main() -> None:
     st.set_page_config(page_title="Log Anonymizer", layout="wide")
     _init_state()
     # Pump queues early so status updates render in the left column.
     _pump_logs_once()
 
-    st.title("Log Anonymizer")
+    _render_header()
 
     run = _render_sidebar()
     center, right = st.columns([3.8, 1.2], gap="large")
 
     with center:
-        top = st.columns([1.2, 1.2, 8])
+        top = st.columns([1.1, 1.6, 8])
         run_clicked = top[0].button("Run", type="primary")
         clear_clicked = top[1].button(
             "Clear log", disabled=st.session_state.get("run_in_progress", False)

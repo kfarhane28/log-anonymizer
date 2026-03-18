@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import secrets
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -81,9 +80,6 @@ def process_with_result(
         ProcessorResult including generated zip file path.
     """
     cfg = config or ProcessorConfig()
-    run_id = secrets.token_hex(4)
-    logger.info("run_started", extra={"run_id": run_id, "motto": _run_motto(run_id)})
-
     out_dir = output_dir.expanduser().resolve()
     if out_dir.exists() and not out_dir.is_dir():
         raise ValueError(f"--output must be a directory: {out_dir}")
@@ -151,22 +147,6 @@ def process_with_result(
         failed_files=failed,
         excluded_files=excluded_count,
     )
-
-
-def _run_motto(run_id: str) -> str:
-    """
-    Generate a short, harmless "motto" for the run to make logs easier to scan.
-    Deterministic given `run_id`.
-    """
-    adjectives = ("quiet", "steady", "careful", "swift", "clean")
-    verbs = ("sanitize", "reshape", "mask", "trim", "seal")
-    nouns = ("traces", "tokens", "paths", "identities", "secrets")
-
-    seed = int(run_id, 16)
-    a = adjectives[seed % len(adjectives)]
-    v = verbs[(seed // 7) % len(verbs)]
-    n = nouns[(seed // 49) % len(nouns)]
-    return f"{a} hands {v} {n}"
 
 
 def _load_exclude_filter(
