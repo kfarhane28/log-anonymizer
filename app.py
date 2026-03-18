@@ -60,7 +60,7 @@ def main() -> None:
 
     with center:
         top = st.columns([1.4, 1.1, 6])
-        run_clicked = top[0].button("Run anonymization", type="primary")
+        run_clicked = top[0].button("Run", type="primary")
         clear_clicked = top[1].button(
             "Clear logs", disabled=st.session_state.get("run_in_progress", False)
         )
