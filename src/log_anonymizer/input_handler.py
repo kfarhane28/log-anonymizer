@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import shutil
 import tempfile
+import tarfile
 import zipfile
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -31,17 +32,17 @@ class InputHandlingResult:
 @contextmanager
 def handle_input(input_path: Path) -> Iterator[InputHandlingResult]:
     """
-    Prepare an input path (directory, file, or zip archive) for processing.
+    Prepare an input path (directory, file, or archive) for processing.
 
     Responsibilities:
     - Detect input type automatically.
     - If directory: recursively list all files.
     - If file: treat as a single file.
-    - If zip: safely extract to a temporary directory and recursively list extracted files.
+    - If archive (.zip / .tar.gz / .tgz): safely extract to a temporary directory and recursively list extracted files.
 
     Returns:
         A context manager yielding an InputHandlingResult. Temporary directories created
-        for zip inputs are cleaned up automatically on exit.
+        for archive inputs are cleaned up automatically on exit.
 
     Notes:
         For very large archives, a streaming approach (reading zip members without full
@@ -67,6 +68,19 @@ def handle_input(input_path: Path) -> Iterator[InputHandlingResult]:
             tmp_dir = Path(tempfile.mkdtemp(prefix="log-anonymizer-input-")).resolve()
             logger.debug("zip_extract_start", extra={"zip": str(resolved), "tmp_dir": str(tmp_dir)})
             _extract_zip_streaming(resolved, tmp_dir)
+            files = list(_iter_files(tmp_dir))
+            logger.info("input_files_listed", extra={"count": len(files), "working_dir": str(tmp_dir)})
+            yield InputHandlingResult(working_dir=tmp_dir, files=files)
+            return
+
+        if resolved.is_file() and _is_tar_gz(resolved):
+            logger.info("input_detected", extra={"type": "tar.gz", "path": str(resolved)})
+            tmp_dir = Path(tempfile.mkdtemp(prefix="log-anonymizer-input-")).resolve()
+            logger.debug(
+                "tar_extract_start",
+                extra={"tar": str(resolved), "tmp_dir": str(tmp_dir)},
+            )
+            _extract_tar_gz_streaming(resolved, tmp_dir)
             files = list(_iter_files(tmp_dir))
             logger.info("input_files_listed", extra={"count": len(files), "working_dir": str(tmp_dir)})
             yield InputHandlingResult(working_dir=tmp_dir, files=files)
@@ -133,3 +147,46 @@ def _extract_zip_streaming(zip_path: Path, dest_dir: Path) -> None:
             with zf.open(info, "r") as src, target.open("wb") as dst:
                 shutil.copyfileobj(src, dst, length=1024 * 1024)
 
+
+def _is_tar_gz(path: Path) -> bool:
+    name = path.name.lower()
+    return name.endswith(".tar.gz") or name.endswith(".tgz")
+
+
+def _extract_tar_gz_streaming(tar_gz_path: Path, dest_dir: Path) -> None:
+    """
+    Extract `tar_gz_path` into `dest_dir` in a safe, streaming way.
+
+    - Defends against Tar Slip (path traversal)
+    - Only extracts regular files (skips symlinks, hardlinks, devices, etc.)
+    - Streams each member to disk (does not load whole members into memory)
+    """
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest_root = dest_dir.resolve()
+
+    with tarfile.open(tar_gz_path, mode="r:gz") as tf:
+        for member in tf.getmembers():
+            if member.isdir():
+                continue
+            if not member.isreg():
+                logger.debug(
+                    "skip_non_regular_tar_member",
+                    extra={"member": member.name, "type": member.type},
+                )
+                continue
+
+            name = member.name
+            # Basic sanity: reject absolute paths and traversal.
+            if name.startswith(("/", "\\")) or ".." in Path(name).parts:
+                raise ValueError(f"Unsafe tar member path: {name}")
+
+            target = (dest_dir / name).resolve()
+            if dest_root not in target.parents and target != dest_root:
+                raise ValueError(f"Unsafe tar member path: {name}")
+
+            target.parent.mkdir(parents=True, exist_ok=True)
+            src = tf.extractfile(member)
+            if src is None:
+                continue
+            with src, target.open("wb") as dst:
+                shutil.copyfileobj(src, dst, length=1024 * 1024)

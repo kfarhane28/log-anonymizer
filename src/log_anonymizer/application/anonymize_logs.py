@@ -10,8 +10,9 @@ from log_anonymizer.infrastructure.filtering.exclude_filter import ExcludeFilter
 from log_anonymizer.infrastructure.filtering.file_collector import collect_files
 from log_anonymizer.infrastructure.input_handlers.directory import DirectoryInputHandler
 from log_anonymizer.infrastructure.input_handlers.single_file import SingleFileInputHandler
+from log_anonymizer.infrastructure.input_handlers.tar_gz_archive import TarGzArchiveInputHandler
 from log_anonymizer.infrastructure.input_handlers.zip_archive import ZipArchiveInputHandler
-from log_anonymizer.infrastructure.output.zip_output import ZipOutputManager
+from log_anonymizer.infrastructure.output.tar_gz_output import TarGzOutputManager
 from log_anonymizer.infrastructure.rules_loader.json_rules_loader import JsonRulesLoader
 from log_anonymizer.utils.io import open_text_best_effort
 
@@ -45,7 +46,7 @@ def anonymize_logs(req: AnonymizeLogsRequest) -> None:
         files = collect_files(root_dir=prepared.root_dir, only_relative=prepared.only_relative, exclude=exclude)
         logger.info("collected_files", extra={"count": len(files)})
 
-        with ZipOutputManager(req.output_zip_path) as out:
+        with TarGzOutputManager(req.output_zip_path) as out:
             for f in files:
                 _anonymize_one(engine, f.absolute_path, out.root_dir / f.relative_path)
         logger.info("done", extra={"output": str(req.output_zip_path), "files": len(files)})
@@ -56,11 +57,18 @@ def anonymize_logs(req: AnonymizeLogsRequest) -> None:
 def _select_input_handler(input_path: Path):
     if input_path.is_dir():
         return DirectoryInputHandler()
+    if input_path.is_file() and _is_tar_gz(input_path):
+        return TarGzArchiveInputHandler()
     if input_path.is_file() and input_path.suffix.lower() == ".zip":
         return ZipArchiveInputHandler()
     if input_path.is_file():
         return SingleFileInputHandler()
     raise ValueError(f"Unsupported input path: {input_path}")
+
+
+def _is_tar_gz(path: Path) -> bool:
+    name = path.name.lower()
+    return name.endswith(".tar.gz") or name.endswith(".tgz")
 
 
 def _load_exclude(exclude_path: Path | None, prepared_root: Path, original_input: Path) -> ExcludeFilter | None:

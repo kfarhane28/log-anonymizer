@@ -73,10 +73,8 @@ def load_rules(rules_path: Path) -> list[Rule]:
         if rule is not None:
             out.append(rule)
 
-    if not out:
-        logger.warning("no_valid_rules_loaded", extra={"path": str(rules_path)})
-    else:
-        logger.info("rules_loaded", extra={"path": str(rules_path), "count": len(out)})
+    # An empty rules file is valid (e.g., when relying on built-in rules only).
+    logger.info("rules_loaded", extra={"path": str(rules_path), "count": len(out)})
     return out
 
 
@@ -170,4 +168,3 @@ def _normalize_case_sensitive(value: Any, *, default: bool) -> bool:
         return bool(value)
     logger.warning("invalid_caseSensitive_value", extra={"value": str(value)})
     return default
-

@@ -24,6 +24,11 @@ def default_rules() -> list[Rule]:
     Built-in rules for common sensitive patterns found in Hadoop ecosystem logs.
 
     These provide a baseline; users can override or add rules via `merge_rules()`.
+
+    Note:
+        This set is intentionally small. Most patterns (paths, hostnames, etc.) live in
+        `examples/rules.json` so users can tailor them to their environments without
+        code changes.
     """
     rules: list[Rule] = []
 
@@ -33,19 +38,14 @@ def default_rules() -> list[Rule]:
         _make(
             "IPv6 address",
             trigger=":",
-            search=r"\b(?:[0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}\b",
+            # Avoid false positives on timestamps (e.g. 12:50:34), MAC addresses, etc.
+            #
+            # Strategy:
+            # - never match empty hextets except via a `::` compression
+            # - if no `::`, require at least 4 colons (so we don't match short colon tokens)
+            search=r"\b(?!\d{1,2}:\d{2}:\d{2}\b)(?!(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}\b)(?:(?:[0-9A-Fa-f]{1,4}:){4,7}[0-9A-Fa-f]{1,4}|(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4})*)?::(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4})*)?)\b",
             replace="[IPV6]",
             case_sensitive=True,
-        )
-    )
-
-    # Hostnames / FQDNs (very common in HDFS/YARN/Spark logs)
-    rules.append(
-        _make(
-            "Hostname/FQDN",
-            trigger=".",
-            search=r"\b(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+(?:[A-Za-z]{2,63})\b",
-            replace="[HOST]",
         )
     )
 
@@ -86,34 +86,15 @@ def default_rules() -> list[Rule]:
             case_sensitive=False,
         )
     )
+
+    # Passwords (key/value)
     rules.append(
         _make(
-            "uid=...",
-            trigger="uid=",
-            search=r"\buid\s*=\s*([A-Za-z0-9._-]+)\b",
-            replace="uid=[USER]",
+            "password=...",
+            trigger="password=",
+            search=r"\bpassword\s*=\s*([^\s\"']+)\b",
+            replace="password=[REDACTED]",
             case_sensitive=False,
-        )
-    )
-
-    # HDFS-style user paths
-    rules.append(
-        _make(
-            "/user/<name>/ path",
-            trigger="/user/",
-            search=r"(?i)(/user/)([A-Za-z0-9._-]+)(/)",
-            replace=r"\1[USER]\3",
-            case_sensitive=True,
-        )
-    )
-
-    # Generic absolute file paths (Linux-like). This is intentionally conservative to avoid over-redaction.
-    rules.append(
-        _make(
-            "Absolute file path",
-            trigger="/",
-            search=r"(?<![A-Za-z0-9_])/(?:[A-Za-z0-9._-]+/){2,}[A-Za-z0-9._-]+",
-            replace="[PATH]",
         )
     )
 
@@ -166,4 +147,3 @@ def _make(
         replacement=replace,
         case_sensitive=case_sensitive,
     )
-

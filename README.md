@@ -12,14 +12,14 @@
 
 Production-ready CLI + Streamlit UI to redact/anonymize Hadoop ecosystem logs (HDFS, YARN, Hive, Spark, Impala, etc.) before sharing support bundles.
 
-The project ships with sensible built-in rules (IPs, hostnames, Kerberos principals, usernames, common paths) and lets you add your own rules and exclude patterns.
+The project ships with a minimal set of built-in rules (IPs, Kerberos principals, common user/password key/value patterns) and lets you add your own rules and exclude patterns.
 
 ## Features
 
-- Inputs: directory, single file, or `.zip` archive
-- Outputs: anonymized files in an output directory + a `.zip` archive (preserves structure)
-- `.exclude` support (glob patterns) to exclude sensitive/binary/large artifacts from both processing and output zip
-- Built-in Hadoop-focused redaction rules + user-provided rules (`rules.json`)
+- Inputs: directory, single file, `.zip` archive, or `.tar.gz` archive
+- Outputs: anonymized files in an output directory + a `.tar.gz` archive (preserves structure)
+- `.exclude` support (glob patterns) to exclude sensitive/binary/large artifacts from both processing and output archive
+- Built-in Hadoop-focused redaction rules + optional user-provided rules (`rules.json`)
 - Structured logging (JSON) at `INFO` by default (configurable)
 - Streams large files line-by-line (memory efficient); skips likely-binary files
 
@@ -37,14 +37,12 @@ pip install -e .
 ```bash
 log-anonymizer \
   --input tmp_test/in \
-  --output tmp_test/out \
-  --rules examples/rules.json \
-  --exclude examples/.exclude
+  --output tmp_test/out
 ```
 
 Output:
 - anonymized files are written under `tmp_test/out/`
-- the tool generates `tmp_test/out.zip` and prints its path
+- the tool generates `tmp_test/out.tar.gz` and prints its path
 
 ## Web UI (Streamlit)
 
@@ -57,8 +55,11 @@ streamlit run app.py
 
 The UI exposes the same options as the CLI, plus:
 - live logs
-- download button for the resulting zip
+- download button for the resulting archive
 - editable **Rules** and **Exclude** tabs (view/modify uploaded content interactively)
+- **Preview anonymisation** tab to test anonymization on pasted log lines (no files written)
+
+In **Preview anonymisation**, paste a small log excerpt, click **Anonymiser**, and review the anonymized output immediately (in-memory; no output files are generated).
 
 ## Usage
 
@@ -97,6 +98,16 @@ log-anonymizer \
   --exclude examples/.exclude
 ```
 
+Anonymize a tar.gz support bundle:
+
+```bash
+log-anonymizer \
+  --input /path/to/support-bundle.tar.gz \
+  --output anonymized-out \
+  --rules examples/rules.json \
+  --exclude examples/.exclude
+```
+
 ### Dry-run
 
 Preview which files will be processed, and how rules/exclude will be applied:
@@ -105,8 +116,6 @@ Preview which files will be processed, and how rules/exclude will be applied:
 log-anonymizer \
   --input /path/to/support-bundle.zip \
   --output anonymized-out \
-  --rules examples/rules.json \
-  --exclude examples/.exclude \
   --dry-run
 ```
 

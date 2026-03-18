@@ -14,21 +14,28 @@ from queue import Empty, Queue
 from typing import Any, Literal
 
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 
 from log_anonymizer.exclude_filter import ExcludeFilter
 from log_anonymizer.input_handler import handle_input
 from log_anonymizer.exclude_filter import load_patterns as _load_exclude_patterns
+from log_anonymizer.application.preview_anonymization import (
+    PreviewAnonymizationRequest,
+    preview_anonymization,
+)
 from log_anonymizer.processor import ProcessorConfig, process_with_result
 from log_anonymizer.rules_loader import load_rules
 
 
-InputMode = Literal["Upload file", "Upload zip", "Use path"]
+InputMode = Literal["Upload file", "Upload archive", "Use path"]
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
 class PreparedRun:
-    input_path: Path
+    input_path: Path | None
     rules_path: Path
     exclude_path: Path | None
     output_dir: Path
@@ -81,7 +88,7 @@ def main() -> None:
     _render_header()
 
     run = _render_sidebar()
-    center, right = st.columns([3.8, 1.2], gap="large")
+    center, right = st.columns([5.5, 1.0], gap="large")
 
     with center:
         top = st.columns([1.1, 1.6, 8])
@@ -104,7 +111,9 @@ def main() -> None:
         if st.session_state.get("run_error"):
             st.error(st.session_state["run_error"])
 
-        logs_tab, rules_tab, exclude_tab = st.tabs(["Logs", "Rules", "Exclude"])
+        logs_tab, rules_tab, exclude_tab, preview_tab = st.tabs(
+            ["Logs", "Rules", "Exclude", "Anonymization Preview"]
+        )
 
         with logs_tab:
             log_container = st.container(border=True, height=760)
@@ -122,19 +131,22 @@ def main() -> None:
         with exclude_tab:
             _render_exclude_editor()
 
+        with preview_tab:
+            _render_preview_tab(run)
+
     with right:
         st.subheader("Output")
         st.write(f"Output directory: `{run.output_dir}`")
-        st.write(f"Output zip: `{run.output_dir.with_suffix('.zip')}`")
+        st.write(f"Output archive: `{run.output_dir.with_suffix('.tar.gz')}`")
 
         if st.session_state.get("result_zip_bytes") is not None:
             st.success("Done.")
             st.download_button(
-                "Download zip",
+                "Download archive",
                 data=st.session_state["result_zip_bytes"],
-                file_name=st.session_state.get("result_zip_name", "anonymized.zip"),
-                mime="application/zip",
-                use_container_width=True,
+                file_name=st.session_state.get("result_zip_name", "anonymized.tar.gz"),
+                mime="application/gzip",
+                width="stretch",
             )
 
         st.subheader("Run")
@@ -164,6 +176,13 @@ def _init_state() -> None:
     st.session_state.setdefault("exclude_editor_df", None)
     st.session_state.setdefault("rules_upload_sig", None)
     st.session_state.setdefault("exclude_upload_sig", None)
+    st.session_state.setdefault("preview_input", "")
+    st.session_state.setdefault("preview_output_value", "")
+    st.session_state.setdefault("preview_status", "")
+    st.session_state.setdefault("preview_error", "")
+    # Backward-compat: older versions used a widget key named "preview_output".
+    # Ensure it doesn't linger and cause confusing state errors across hot-reloads.
+    st.session_state.pop("preview_output", None)
 
 
 def _render_sidebar() -> PreparedRun:
@@ -173,7 +192,7 @@ def _render_sidebar() -> PreparedRun:
 
     input_mode: InputMode = st.sidebar.radio(
         "Input source",
-        options=["Upload file", "Upload zip", "Use path"],
+        options=["Upload file", "Upload archive", "Use path"],
         index=0,
     )
 
@@ -181,8 +200,11 @@ def _render_sidebar() -> PreparedRun:
     input_path_text = ""
     if input_mode == "Upload file":
         uploaded_input = st.sidebar.file_uploader("Upload a log file", type=None)
-    elif input_mode == "Upload zip":
-        uploaded_input = st.sidebar.file_uploader("Upload a zip archive", type=["zip"])
+    elif input_mode == "Upload archive":
+        uploaded_input = st.sidebar.file_uploader(
+            "Upload an archive (.zip / .tar.gz)",
+            type=["zip", "tgz", "gz"],
+        )
     else:
         input_path_text = st.sidebar.text_input("Input path", value="tmp_test/in")
 
@@ -227,14 +249,18 @@ def _prepare_files(
 ) -> PreparedRun:
     tmp_dir = _ensure_tmp_dir()
 
-    if input_mode in ("Upload file", "Upload zip"):
+    if input_mode in ("Upload file", "Upload archive"):
         if uploaded_input is None:
-            input_path = Path("")
+            input_path = None
         else:
-            suffix = ".zip" if input_mode == "Upload zip" else ""
-            input_path = _save_upload(tmp_dir, uploaded_input, name_hint=f"input{suffix}")
+            if input_mode == "Upload archive":
+                name_hint = str(getattr(uploaded_input, "name", "") or "input.tar.gz")
+            else:
+                name_hint = str(getattr(uploaded_input, "name", "") or "input")
+            input_path = _save_upload(tmp_dir, uploaded_input, name_hint=name_hint)
     else:
-        input_path = Path(input_path_text).expanduser()
+        raw = (input_path_text or "").strip()
+        input_path = Path(raw).expanduser() if raw else None
 
     if uploaded_rules is None:
         _ensure_rules_editor_initialized()
@@ -336,8 +362,12 @@ def _validate_run(run: PreparedRun) -> str | None:
     ui_errors = st.session_state.get("ui_errors") or []
     if ui_errors:
         return str(ui_errors[0])
-    if not run.input_path or str(run.input_path) == "":
+    if run.input_path is None:
         return "Please provide an input (upload or path)."
+    if str(run.input_path).strip() in ("", "."):
+        return "Please provide an input (upload or path)."
+    if not run.input_path.exists():
+        return f"Input path does not exist: {run.input_path}"
     if not run.output_dir or str(run.output_dir) == "":
         return "Please provide an output directory."
     if not run.input_path.exists():
@@ -355,10 +385,13 @@ def _run_pipeline_thread(
     run: PreparedRun, log_q: Queue[str], outcome_q: Queue[dict[str, Any]]
 ) -> None:
     try:
+        if run.input_path is None:
+            outcome_q.put({"type": "error", "status": "Failed.", "error": "Missing input."})
+            return
         if run.dry_run:
             summary = _dry_run(run)
             log_q.put(summary)
-            outcome_q.put({"type": "done", "status": "Dry run completed.", "zip_path": None})
+            outcome_q.put({"type": "done", "status": "Dry run completed.", "archive_path": None})
             return
 
         cfg = ProcessorConfig(
@@ -375,7 +408,7 @@ def _run_pipeline_thread(
         )
         summary = (
             f"Completed.\n"
-            f"- Output zip: {out_zip.output_zip}\n"
+            f"- Output archive: {out_zip.output_zip}\n"
             f"- Total files: {out_zip.total_files}\n"
             f"- Excluded: {out_zip.excluded_files}\n"
             f"- Processed: {out_zip.processed_files}\n"
@@ -385,7 +418,7 @@ def _run_pipeline_thread(
             {
                 "type": "done",
                 "status": summary,
-                "zip_path": str(out_zip.output_zip),
+                "archive_path": str(out_zip.output_zip),
                 "summary": {
                     "total": out_zip.total_files,
                     "excluded": out_zip.excluded_files,
@@ -402,6 +435,8 @@ def _run_pipeline_thread(
 
 
 def _dry_run(run: PreparedRun) -> str:
+    if run.input_path is None:
+        return "DRY RUN\n- Input: (missing)\n"
     user_rules = load_rules(run.rules_path)
 
     with handle_input(run.input_path) as prepared:
@@ -414,7 +449,7 @@ def _dry_run(run: PreparedRun) -> str:
         )
         filtered = [f for f in files if not (exclude_filter and exclude_filter.should_exclude(f))]
 
-    zip_path = run.output_dir.expanduser().resolve().with_suffix(".zip")
+    zip_path = run.output_dir.expanduser().resolve().with_suffix(".tar.gz")
     exclude_info = "none"
     if run.exclude_path is not None:
         try:
@@ -425,7 +460,7 @@ def _dry_run(run: PreparedRun) -> str:
         "DRY RUN",
         f"- Input: {run.input_path}",
         f"- Output dir: {run.output_dir}",
-        f"- Output zip: {zip_path}",
+        f"- Output archive: {zip_path}",
         f"- User rules loaded: {len(user_rules)} (built-in rules are enabled by default)",
         f"- Exclude: {exclude_info}",
         f"- Files: total={len(files)}, excluded={len(files) - len(filtered)}, to_process={len(filtered)}",
@@ -485,9 +520,9 @@ def _pump_outcome_once() -> None:
 
         if outcome.get("type") == "done":
             st.session_state["run_status"] = str(outcome.get("status") or "Completed.")
-            zip_path = outcome.get("zip_path")
-            if isinstance(zip_path, str) and zip_path:
-                p = Path(zip_path)
+            archive_path = outcome.get("archive_path")
+            if isinstance(archive_path, str) and archive_path:
+                p = Path(archive_path)
                 st.session_state["result_zip_bytes"] = p.read_bytes()
                 st.session_state["result_zip_name"] = p.name
             st.session_state["run_in_progress"] = False
@@ -506,6 +541,108 @@ def _restore_logger_if_needed() -> None:
         _detach_streamlit_logger(handler, prev)
     st.session_state["log_handler"] = None
     st.session_state["log_prev_handlers"] = None
+
+
+def _render_preview_tab(run: PreparedRun) -> None:
+    st.caption("Paste a few log lines to preview anonymization (in-memory; no files written).")
+
+    text_in = st.session_state.get("preview_input") or ""
+    text_out = st.session_state.get("preview_output_value") or ""
+    lines_in = len(text_in.splitlines()) if text_in else 0
+    lines_out = len(text_out.splitlines()) if text_out else 0
+
+    if st.session_state.get("preview_status"):
+        st.success(st.session_state["preview_status"])
+    if st.session_state.get("preview_error"):
+        st.error(st.session_state["preview_error"])
+
+    b1, b2, _ = st.columns([1.2, 1.0, 6])
+    anonymize_clicked = b1.button(
+        "Anonymize",
+        width="stretch",
+        disabled=bool(st.session_state.get("run_in_progress")),
+        key="preview_anonymize_btn",
+    )
+    clear_clicked = b2.button(
+        "Clear",
+        width="stretch",
+        disabled=bool(st.session_state.get("run_in_progress")),
+        key="preview_clear_btn",
+    )
+
+    if anonymize_clicked:
+        st.session_state["preview_error"] = ""
+        st.session_state["preview_status"] = ""
+        try:
+            logger.info("ui_preview_clicked", extra={"lines_in": lines_in})
+            res = preview_anonymization(
+                PreviewAnonymizationRequest(
+                    text=text_in,
+                    rules_path=run.rules_path,
+                    include_builtin_rules=True,
+                )
+            )
+            st.session_state["preview_output_value"] = res.anonymized_text
+            st.session_state["preview_status"] = (
+                f"Success. {res.lines_in} lines → {res.lines_out} lines "
+                f"({res.stats.total_replacements} replacements)."
+            )
+            text_out = st.session_state["preview_output_value"]
+            lines_out = len(text_out.splitlines()) if text_out else 0
+        except Exception as exc:  # noqa: BLE001 (UI boundary)
+            logger.exception("ui_preview_failed", extra={"error": str(exc)})
+            st.session_state["preview_error"] = f"{type(exc).__name__}: {exc}"
+
+    if clear_clicked:
+        st.session_state["preview_input"] = ""
+        st.session_state["preview_output_value"] = ""
+        st.session_state["preview_status"] = ""
+        st.session_state["preview_error"] = ""
+        st.rerun()
+
+    st.text_area(
+        "Input (raw logs)",
+        key="preview_input",
+        height=260,
+        placeholder="Paste a few lines here…",
+    )
+    st.text_area(
+        "Output (anonymized)",
+        value=text_out,
+        height=260,
+        disabled=True,
+    )
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Input lines", lines_in)
+    m2.metric("Output lines", lines_out)
+    m3.metric("User rules", _preview_rules_count(run))
+
+    # Optional "Copy" button (best-effort; may depend on browser permissions).
+    if text_out:
+        copy_payload = json.dumps(text_out)
+        components.html(
+            f"""
+            <div style="display:flex; gap:8px; align-items:center; margin-top: 8px;">
+              <button
+                style="padding:6px 10px; border-radius:6px; border:1px solid #bbb; cursor:pointer;"
+                onclick="navigator.clipboard.writeText({copy_payload});"
+              >
+                Copy result
+              </button>
+              <span style="opacity:0.7; font-size: 12px;">Copies to clipboard (if allowed by your browser).</span>
+            </div>
+            """,
+            height=44,
+        )
+
+
+def _preview_rules_count(run: PreparedRun) -> int:
+    # Best-effort: file always exists in the UI, but keep it resilient.
+    try:
+        user_rules = load_rules(run.rules_path) if run.rules_path and run.rules_path.exists() else []
+    except Exception:
+        user_rules = []
+    return len(user_rules)
 
 
 def _write_default_rules_file(tmp_dir: Path) -> Path:
@@ -703,7 +840,7 @@ def _render_rules_editor() -> None:
         st.session_state["rules_editor_df"],
         key="rules_editor",
         num_rows="dynamic",
-        use_container_width=True,
+        width="stretch",
         column_config={
             "description": st.column_config.TextColumn("description"),
             "trigger": st.column_config.TextColumn("trigger"),
@@ -743,7 +880,7 @@ def _render_exclude_editor() -> None:
         st.session_state["exclude_editor_df"],
         key="exclude_editor",
         num_rows="dynamic",
-        use_container_width=True,
+        width="stretch",
         column_config={"pattern": st.column_config.TextColumn("pattern")},
     )
     st.session_state["exclude_editor_df"] = edited

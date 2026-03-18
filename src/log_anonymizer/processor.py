@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-import zipfile
+import tarfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -35,7 +35,7 @@ class ProcessorResult:
 def process(
     *,
     input_path: Path,
-    rules_path: Path,
+    rules_path: Path | None,
     output_dir: Path,
     output_zip_path: Path | None = None,
     exclude_path: Path | None = None,
@@ -54,7 +54,7 @@ def process(
 def process_with_result(
     *,
     input_path: Path,
-    rules_path: Path,
+    rules_path: Path | None,
     output_dir: Path,
     output_zip_path: Path | None = None,
     exclude_path: Path | None = None,
@@ -64,20 +64,20 @@ def process_with_result(
     Main processing pipeline.
 
     Responsibilities:
-    1) Load input (file/dir/zip)
+    1) Load input (file/dir/archive)
     2) Load exclude patterns
     3) Load rules
     4) Filter files
     5) Process each file with anonymizer (parallel)
     6) Write results to output directory
-    7) Compress output directory into zip
+    7) Compress output directory into a tar.gz archive
 
     Robustness:
     - Continues on per-file errors (logs and skips failing files)
     - Always cleans up temporary directories created during processing
 
     Returns:
-        ProcessorResult including generated zip file path.
+        ProcessorResult including generated archive file path.
     """
     cfg = config or ProcessorConfig()
     out_dir = output_dir.expanduser().resolve()
@@ -85,14 +85,10 @@ def process_with_result(
         raise ValueError(f"--output must be a directory: {out_dir}")
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    out_zip = (
-        output_zip_path.expanduser().resolve()
-        if output_zip_path is not None
-        else out_dir.with_suffix(".zip")
-    )
+    out_zip = _resolve_output_archive_path(out_dir, output_zip_path)
     out_zip.parent.mkdir(parents=True, exist_ok=True)
 
-    user_rules = load_rules(rules_path)
+    user_rules = load_rules(rules_path) if rules_path is not None else []
     rules = (
         merge_rules(builtin=default_rules(), user=user_rules)
         if cfg.include_builtin_rules
@@ -127,7 +123,7 @@ def process_with_result(
             rules=rules,
             max_workers=cfg.max_workers,
         )
-        _zip_dir(out_dir, out_zip)
+        _tar_gz_dir(out_dir, out_zip)
 
     logger.info(
         "pipeline_done",
@@ -226,14 +222,35 @@ def _safe_relative(path: Path, root: Path) -> Path:
         return Path(path.name)
 
 
-def _zip_dir(root_dir: Path, out_zip: Path) -> None:
-    if out_zip.exists():
-        out_zip.unlink()
-    with zipfile.ZipFile(out_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+def _is_tar_gz_path(path: Path) -> bool:
+    name = path.name.lower()
+    return name.endswith(".tar.gz") or name.endswith(".tgz")
+
+
+def _resolve_output_archive_path(output_dir: Path, output_zip_path: Path | None) -> Path:
+    """
+    Resolve the output archive path (tar.gz).
+
+    Notes:
+        The parameter name `output_zip_path` is kept for backward compatibility,
+        but the tool now produces `.tar.gz` archives.
+    """
+    if output_zip_path is None:
+        return output_dir.with_suffix(".tar.gz")
+    out = output_zip_path.expanduser().resolve()
+    if not _is_tar_gz_path(out):
+        raise ValueError(f"Output archive must end with .tar.gz or .tgz: {out}")
+    return out
+
+
+def _tar_gz_dir(root_dir: Path, out_tar_gz: Path) -> None:
+    if out_tar_gz.exists():
+        out_tar_gz.unlink()
+    with tarfile.open(out_tar_gz, mode="w:gz") as tf:
         for p in root_dir.rglob("*"):
             if not p.is_file():
                 continue
-            # Avoid including the zip itself if user points it inside output_dir.
-            if p.resolve() == out_zip.resolve():
+            # Avoid including the archive itself if user points it inside output_dir.
+            if p.resolve() == out_tar_gz.resolve():
                 continue
-            zf.write(p, arcname=p.relative_to(root_dir).as_posix())
+            tf.add(p, arcname=p.relative_to(root_dir).as_posix(), recursive=False)

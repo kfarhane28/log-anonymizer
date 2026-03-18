@@ -18,14 +18,14 @@ from log_anonymizer.rules_loader import load_rules
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="log-anonymizer",
-        description="Anonymize Hadoop/Cloudera logs (directory, file, or zip). Writes anonymized logs to an output directory and produces a zip archive.",
+        description="Anonymize Hadoop/Cloudera logs (directory, file, or archive). Writes anonymized logs to an output directory and produces a .tar.gz archive.",
     )
     parser.add_argument(
         "--input",
         "-i",
         type=Path,
         required=True,
-        help="Input path (directory, single file, or .zip archive).",
+        help="Input path (directory, single file, or .zip/.tar.gz archive).",
     )
     parser.add_argument(
         "--output",
@@ -38,8 +38,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "--rules",
         "-r",
         type=Path,
-        required=True,
-        help="Rules JSON file.",
+        default=None,
+        help="Optional rules JSON file. If omitted, the built-in rules are used (unless --no-default-rules).",
     )
     parser.add_argument(
         "--exclude",
@@ -97,15 +97,17 @@ def main(argv: list[str] | None = None) -> None:
 
     if not input_path.exists():
         _die(f"Input path does not exist: {input_path}")
-    if not rules_path.exists():
+    if rules_path is not None and not rules_path.exists():
         _die(f"Rules file does not exist: {rules_path}")
     if exclude_path is not None and not exclude_path.exists():
         _die(f"Exclude file does not exist: {exclude_path}")
+    if args.no_default_rules and rules_path is None:
+        _die("--no-default-rules requires providing --rules (otherwise there are no rules to apply).")
 
     # Normalize for reproducibility in logs.
     input_path = input_path.resolve()
     output_path = output_path.resolve()
-    rules_path = rules_path.resolve()
+    rules_path = rules_path.resolve() if rules_path is not None else None
     exclude_path = exclude_path.resolve() if exclude_path is not None else None
 
     try:
@@ -150,7 +152,7 @@ def _dry_run(
     *,
     input_path: Path,
     output_dir: Path,
-    rules_path: Path,
+    rules_path: Path | None,
     exclude_path: Path | None,
     exclude_case_insensitive: bool,
     include_builtin: bool,
@@ -161,7 +163,7 @@ def _dry_run(
     if output_dir.exists() and not output_dir.is_dir():
         _die(f"--output must be a directory: {output_dir}")
 
-    user_rules = load_rules(rules_path)
+    user_rules = load_rules(rules_path) if rules_path is not None else []
     rules = merge_rules(builtin=default_rules(), user=user_rules) if include_builtin else user_rules
     if not rules:
         _die("No valid rules loaded; nothing to do.")
@@ -178,11 +180,11 @@ def _dry_run(
         )
         filtered = [f for f in files if not (exclude_filter and exclude_filter.should_exclude(f))]
 
-    zip_path = output_dir.with_suffix(".zip")
+    zip_path = output_dir.with_suffix(".tar.gz")
     print("DRY RUN")
     print(f"- Input: {input_path}")
     print(f"- Output dir: {output_dir}")
-    print(f"- Output zip: {zip_path}")
+    print(f"- Output archive: {zip_path}")
     print(f"- Rules: {len(rules)} (user={len(user_rules)}, builtin={'on' if include_builtin else 'off'})")
     print(f"- Files: total={len(files)}, excluded={len(files) - len(filtered)}, to_process={len(filtered)}")
     for p in filtered[:20]:

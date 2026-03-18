@@ -11,3 +11,4 @@ tmp_test/
 .coverage
 .coverage.*
 htmlcov/
+.vscode

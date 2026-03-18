@@ -16,11 +16,39 @@
       "caseSensitive": "false"
     },
     {
+      "description": "Absolute file path",
+      "trigger": "/",
+      "search": "(?<![A-Za-z0-9_])/(?:[A-Za-z0-9._-]+/){2,}[A-Za-z0-9._-]+",
+      "replace": "[PATH]",
+      "caseSensitive": "true"
+    },
+    {
+      "description": "Hostname (cdc.fr)",
+      "trigger": "cdc.fr",
+      "search": "(?i)\\b(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\\.)+cdc\\.fr\\b",
+      "replace": "[HOST]",
+      "caseSensitive": "false"
+    },
+    {
       "description": "UUID",
       "trigger": "-",
       "search": "\\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\\b",
       "replace": "[UUID]",
       "caseSensitive": "true"
+    },
+    {
+      "description": "Person token (e.g. csoprasteriabq-e)",
+      "trigger": "-",
+      "search": "\\b[a-z]{12,}-[a-z]\\b",
+      "replace": "[PERSON]",
+      "caseSensitive": "true"
+    },
+    {
+      "description": "uid=... (key/value)",
+      "trigger": "uid=",
+      "search": "(?i)\\buid\\s*=\\s*([A-Za-z0-9._-]+)\\b",
+      "replace": "uid=[USER]",
+      "caseSensitive": "false"
     },
     {
       "description": "user=... (key/value)",
