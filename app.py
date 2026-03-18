@@ -15,6 +15,7 @@ import streamlit as st
 
 from log_anonymizer.exclude_filter import ExcludeFilter
 from log_anonymizer.input_handler import handle_input
+from log_anonymizer.exclude_filter import load_patterns as _load_exclude_patterns
 from log_anonymizer.processor import ProcessorConfig, process_with_result
 from log_anonymizer.rules_loader import load_rules
 
@@ -105,11 +106,13 @@ def _init_state() -> None:
     st.session_state.setdefault("log_handler", None)
     st.session_state.setdefault("log_prev_handlers", None)
     st.session_state.setdefault("ui_warnings", [])
+    st.session_state.setdefault("ui_errors", [])
 
 
 def _render_sidebar() -> PreparedRun:
     st.sidebar.header("Configuration")
     st.session_state["ui_warnings"] = []
+    st.session_state["ui_errors"] = []
 
     input_mode: InputMode = st.sidebar.radio(
         "Input source",
@@ -143,6 +146,10 @@ def _render_sidebar() -> PreparedRun:
         verbose=verbose,
         dry_run=dry_run,
     )
+    if st.session_state.get("ui_errors"):
+        st.sidebar.markdown("---")
+        for e in st.session_state["ui_errors"]:
+            st.sidebar.error(e)
     for w in st.session_state.get("ui_warnings", []):
         st.sidebar.warning(w)
     return prepared
@@ -173,15 +180,20 @@ def _prepare_files(
     if uploaded_rules is None:
         rules_path = _write_default_rules_file(tmp_dir)
     else:
-        rules_path = _save_upload(tmp_dir, uploaded_rules, name_hint="rules.json")
+        raw = bytes(uploaded_rules.getbuffer())
+        err = _validate_rules_json_bytes(raw)
+        if err:
+            st.session_state["ui_errors"].append(f"Rules JSON invalid: {err}")
+            rules_path = _write_default_rules_file(tmp_dir)
+        else:
+            rules_path = _save_upload(tmp_dir, uploaded_rules, name_hint="rules.json")
 
     exclude_path = None
     if uploaded_exclude is not None:
         raw = bytes(uploaded_exclude.getbuffer())
-        if _looks_like_json(raw) or str(uploaded_exclude.name).lower().endswith(".json"):
-            st.session_state["ui_warnings"].append(
-                "Exclude file looks like JSON (rules). Did you upload the wrong file? Exclude will be ignored."
-            )
+        err = _validate_exclude_bytes(raw, filename=str(uploaded_exclude.name))
+        if err:
+            st.session_state["ui_errors"].append(f"Exclude file invalid: {err}")
             exclude_path = None
         else:
             exclude_path = _save_upload(tmp_dir, uploaded_exclude, name_hint=".exclude")
@@ -255,6 +267,9 @@ def _start_run(run: PreparedRun) -> None:
 
 
 def _validate_run(run: PreparedRun) -> str | None:
+    ui_errors = st.session_state.get("ui_errors") or []
+    if ui_errors:
+        return str(ui_errors[0])
     if not run.input_path or str(run.input_path) == "":
         return "Please provide an input (upload or path)."
     if not run.output_dir or str(run.output_dir) == "":
@@ -334,12 +349,19 @@ def _dry_run(run: PreparedRun) -> str:
         filtered = [f for f in files if not (exclude_filter and exclude_filter.should_exclude(f))]
 
     zip_path = run.output_dir.expanduser().resolve().with_suffix(".zip")
+    exclude_info = "none"
+    if run.exclude_path is not None:
+        try:
+            exclude_info = f"{run.exclude_path} ({len(_load_exclude_patterns(run.exclude_path))} patterns)"
+        except Exception:
+            exclude_info = str(run.exclude_path)
     lines = [
         "DRY RUN",
         f"- Input: {run.input_path}",
         f"- Output dir: {run.output_dir}",
         f"- Output zip: {zip_path}",
         f"- User rules loaded: {len(user_rules)} (built-in rules are enabled by default)",
+        f"- Exclude: {exclude_info}",
         f"- Files: total={len(files)}, excluded={len(files) - len(filtered)}, to_process={len(filtered)}",
     ]
     preview = [f"  - {p}" for p in filtered[:20]]
@@ -440,6 +462,75 @@ def _looks_like_json(raw: bytes) -> bool:
         return True
     except Exception:
         return False
+
+
+def _validate_rules_json_bytes(raw: bytes) -> str | None:
+    """
+    Validate that uploaded rules.json is parseable and follows the expected schema.
+    """
+    try:
+        obj = json.loads(raw.decode("utf-8"))
+    except UnicodeDecodeError:
+        return "not valid UTF-8"
+    except json.JSONDecodeError as exc:
+        return f"invalid JSON: {exc}"
+
+    if not isinstance(obj, dict):
+        return "root must be a JSON object"
+    if obj.get("version") != 1:
+        return "version must be 1"
+    rules = obj.get("rules")
+    if not isinstance(rules, list):
+        return "rules must be a list"
+
+    for i, r in enumerate(rules):
+        if not isinstance(r, dict):
+            return f"rules[{i}] must be an object"
+        for key in ("trigger", "search", "replace"):
+            if key not in r:
+                return f"rules[{i}] missing '{key}'"
+            if not isinstance(r[key], str):
+                return f"rules[{i}].{key} must be a string"
+        if "description" in r and r["description"] is not None and not isinstance(r["description"], str):
+            return f"rules[{i}].description must be a string"
+        if "caseSensitive" in r and r["caseSensitive"] is not None and not isinstance(
+            r["caseSensitive"], (str, bool, int, float)
+        ):
+            return f"rules[{i}].caseSensitive must be boolean or string"
+    return None
+
+
+def _validate_exclude_bytes(raw: bytes, *, filename: str) -> str | None:
+    """
+    Validate that uploaded exclude file is plausible text.
+
+    Heuristics:
+    - Must not look like JSON
+    - Must be UTF-8 decodable
+    - Must not contain NUL bytes
+    - Each non-comment line is treated as a glob pattern
+    """
+    if b"\x00" in raw:
+        return "file looks binary (contains NUL bytes)"
+    if _looks_like_json(raw) or filename.lower().endswith(".json"):
+        return "file looks like JSON; did you upload rules.json by mistake?"
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return "file is not valid UTF-8 text"
+
+    lines = text.splitlines()
+    patterns = []
+    for line in lines:
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        patterns.append(s)
+        if len(s) > 512:
+            return "a pattern line is too long (>512 chars)"
+    if not patterns:
+        st.session_state["ui_warnings"].append("Exclude file contains no patterns (only comments/blank lines).")
+    return None
 
 
 if __name__ == "__main__":
