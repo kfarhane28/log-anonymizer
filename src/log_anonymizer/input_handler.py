@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
 
+from log_anonymizer.utils.io import is_text_bytes, is_text_file
+
 logger = logging.getLogger(__name__)
 
 
@@ -88,6 +90,10 @@ def handle_input(input_path: Path) -> Iterator[InputHandlingResult]:
 
         if resolved.is_file():
             logger.info("input_detected", extra={"type": "file", "path": str(resolved)})
+            if not is_text_file(resolved):
+                logger.info("Skipping non-text file: %s", resolved)
+                yield InputHandlingResult(working_dir=resolved.parent, files=[])
+                return
             yield InputHandlingResult(working_dir=resolved.parent, files=[resolved])
             return
 
@@ -117,6 +123,9 @@ def _iter_files(root_dir: Path) -> Iterator[Path]:
                 if entry.is_dir():
                     stack.append(entry)
                 elif entry.is_file():
+                    if not is_text_file(entry):
+                        logger.info("Skipping non-text file: %s", entry)
+                        continue
                     logger.debug("discovered_file", extra={"path": str(entry)})
                     yield entry
         except OSError as exc:
@@ -144,8 +153,14 @@ def _extract_zip_streaming(zip_path: Path, dest_dir: Path) -> None:
                 raise ValueError(f"Unsafe zip member path: {info.filename}")
 
             target.parent.mkdir(parents=True, exist_ok=True)
-            with zf.open(info, "r") as src, target.open("wb") as dst:
-                shutil.copyfileobj(src, dst, length=1024 * 1024)
+            with zf.open(info, "r") as src:
+                head = src.read(8192)
+                if not is_text_bytes(head):
+                    logger.info("Skipping non-text file: %s", zip_path / info.filename)
+                    continue
+                with target.open("wb") as dst:
+                    dst.write(head)
+                    shutil.copyfileobj(src, dst, length=1024 * 1024)
 
 
 def _is_tar_gz(path: Path) -> bool:
@@ -188,5 +203,11 @@ def _extract_tar_gz_streaming(tar_gz_path: Path, dest_dir: Path) -> None:
             src = tf.extractfile(member)
             if src is None:
                 continue
-            with src, target.open("wb") as dst:
-                shutil.copyfileobj(src, dst, length=1024 * 1024)
+            with src:
+                head = src.read(8192)
+                if not is_text_bytes(head):
+                    logger.info("Skipping non-text file: %s", tar_gz_path / name)
+                    continue
+                with target.open("wb") as dst:
+                    dst.write(head)
+                    shutil.copyfileobj(src, dst, length=1024 * 1024)

@@ -149,7 +149,7 @@ User rules are applied in addition to built-in rules. File format:
 ```
 
 Notes:
-- `trigger` is a fast substring pre-check (rule runs only if the trigger is present in the line).
+- `trigger` is an optional fast substring pre-check (rule runs only if the trigger is present in the line). If omitted/empty, the rule runs on every line.
 - `search` is a Python regex, `replace` is passed to `re.sub`.
 - `caseSensitive` defaults to `true` if omitted.
 

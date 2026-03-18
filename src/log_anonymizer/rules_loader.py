@@ -17,7 +17,7 @@ class Rule:
 
     Attributes:
         description: Human-readable description (may be empty).
-        trigger: Substring used as a fast pre-check before running the regex.
+        trigger: Optional substring used as a fast pre-check before running the regex.
         regex: Compiled regex used for the replacement.
         replacement: Replacement string passed to `re.sub`.
         case_sensitive: Whether trigger check and regex are case sensitive.
@@ -30,6 +30,8 @@ class Rule:
     case_sensitive: bool
 
     def triggered_by(self, line: str) -> bool:
+        if not self.trigger:
+            return True
         if self.case_sensitive:
             return self.trigger in line
         return self.trigger.lower() in line.lower()
@@ -97,11 +99,15 @@ def _parse_rule(raw: Any, *, index: int, rules_path: Path) -> Rule | None:
 
     description = str(raw.get("description") or "")
 
-    trigger = raw.get("trigger")
-    if not isinstance(trigger, str) or not trigger:
+    trigger_raw = raw.get("trigger", "")
+    if trigger_raw is None:
+        trigger = ""
+    elif isinstance(trigger_raw, str):
+        trigger = trigger_raw
+    else:
         logger.warning(
             "invalid_rule_skipped",
-            extra={"index": index, "reason": "missing_trigger", "description": description},
+            extra={"index": index, "reason": "trigger_not_string", "description": description},
         )
         return None
 
@@ -113,6 +119,12 @@ def _parse_rule(raw: Any, *, index: int, rules_path: Path) -> Rule | None:
         )
         return None
 
+    if "replace" not in raw:
+        logger.warning(
+            "invalid_rule_skipped",
+            extra={"index": index, "reason": "missing_replace", "description": description},
+        )
+        return None
     replace = raw.get("replace")
     if replace is None:
         replacement = ""

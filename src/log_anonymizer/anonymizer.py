@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Iterable, Iterator, TextIO
 
 from log_anonymizer.rules_loader import Rule
+from log_anonymizer.utils.io import is_text_file
 
 logger = logging.getLogger(__name__)
 
@@ -66,7 +67,7 @@ def _iter_anonymized_lines(
         for rule in rules_list:
             if not rule.triggered_by(new_line):
                 continue
-            key = rule.description or rule.trigger
+            key = rule.description or rule.trigger or rule.regex.pattern
             acc.triggered.add(key)
             new_line, n = rule.regex.subn(rule.replacement, new_line)
             if n:
@@ -135,7 +136,7 @@ def _open_text_best_effort(path: Path) -> TextIO:
 
     Returns an open file handle; caller must close it.
     """
-    if _looks_binary(path):
+    if not is_text_file(path):
         raise ValueError(f"Binary/non-text file: {path}")
     try:
         f = path.open("r", encoding="utf-8", errors="strict", newline="")
@@ -148,9 +149,5 @@ def _open_text_best_effort(path: Path) -> TextIO:
 
 
 def _looks_binary(path: Path, *, sniff_bytes: int = 8192) -> bool:
-    try:
-        with path.open("rb") as f:
-            chunk = f.read(sniff_bytes)
-    except OSError:
-        return True
-    return b"\x00" in chunk
+    # Kept for backward compatibility (and to preserve existing unit tests that import this module).
+    return not is_text_file(path, sniff_bytes=sniff_bytes)

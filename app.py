@@ -930,11 +930,15 @@ def _validate_rules_json_bytes(raw: bytes) -> str | None:
     for i, r in enumerate(rules):
         if not isinstance(r, dict):
             return f"rules[{i}] must be an object"
-        for key in ("trigger", "search", "replace"):
+        for key in ("search", "replace"):
             if key not in r:
                 return f"rules[{i}] missing '{key}'"
             if not isinstance(r[key], str):
                 return f"rules[{i}].{key} must be a string"
+        if not r["search"].strip():
+            return f"rules[{i}].search must be a non-empty string"
+        if "trigger" in r and r["trigger"] is not None and not isinstance(r["trigger"], str):
+            return f"rules[{i}].trigger must be a string"
         if "description" in r and r["description"] is not None and not isinstance(r["description"], str):
             return f"rules[{i}].description must be a string"
         if "caseSensitive" in r and r["caseSensitive"] is not None and not isinstance(

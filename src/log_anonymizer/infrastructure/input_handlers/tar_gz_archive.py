@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import logging
 import shutil
 import tarfile
 import tempfile
 from pathlib import Path
 
 from log_anonymizer.infrastructure.input_handlers.base import PreparedInput
+from log_anonymizer.utils.io import is_text_bytes
+
+logger = logging.getLogger(__name__)
 
 
 class TarGzArchiveInputHandler:
@@ -60,6 +64,11 @@ def _safe_extract_tar_gz(tar_gz_path: Path, dest: Path) -> None:
             src = tf.extractfile(member)
             if src is None:
                 continue
-            with src, member_path.open("wb") as dst:
-                shutil.copyfileobj(src, dst, length=1024 * 1024)
-
+            with src:
+                head = src.read(8192)
+                if not is_text_bytes(head):
+                    logger.info("Skipping non-text file: %s", tar_gz_path / name)
+                    continue
+                with member_path.open("wb") as dst:
+                    dst.write(head)
+                    shutil.copyfileobj(src, dst, length=1024 * 1024)

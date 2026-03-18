@@ -43,6 +43,24 @@ def test_anonymize_applies_only_when_trigger_present(tmp_path: Path) -> None:
     assert "replace secret" in stats.triggered_rules
 
 
+def test_anonymize_applies_rule_without_trigger(tmp_path: Path) -> None:
+    inp = tmp_path / "in.log"
+    out = tmp_path / "out.log"
+    inp.write_text("abc\nzzz\n", encoding="utf-8")
+
+    rule = Rule(
+        description="",
+        trigger="",
+        regex=__import__("re").compile(r"abc"),
+        replacement="[X]",
+        case_sensitive=True,
+    )
+    stats = anonymize_file(inp, out, [rule])
+    assert out.read_text(encoding="utf-8") == "[X]\nzzz\n"
+    assert stats.total_replacements == 1
+    assert r"abc" in stats.triggered_rules
+
+
 def test_anonymize_rejects_binary_content(tmp_path: Path) -> None:
     inp = tmp_path / "bin.log"
     out = tmp_path / "out.log"
@@ -57,4 +75,3 @@ def test_anonymize_rejects_binary_content(tmp_path: Path) -> None:
     )
     with pytest.raises(ValueError):
         anonymize_file(inp, out, [rule])
-
