@@ -124,6 +124,64 @@ def main() -> None:
             with log_container:
                 st.code("\n".join(st.session_state["log_lines"][-1200:]), language="text")
 
+            # Show profiling outputs prominently below logs (useful for dry-run profiling).
+            if (
+                st.session_state.get("profiling_report_bytes") is not None
+                or st.session_state.get("suggested_rules_bytes") is not None
+            ):
+                st.markdown("---")
+                st.subheader("Profiling outputs")
+
+                if st.session_state.get("profiling_report_bytes") is not None:
+                    c1, c2 = st.columns([10, 1])
+                    with c1:
+                        st.markdown("**Profiling report**")
+                    with c2:
+                        st.download_button(
+                            "⬇",
+                            data=st.session_state["profiling_report_bytes"],
+                            file_name=st.session_state.get(
+                                "profiling_report_name", "profiling_report.json"
+                            ),
+                            mime="application/json",
+                            help="Download profiling report",
+                            use_container_width=True,
+                        )
+                    try:
+                        report_text = st.session_state["profiling_report_bytes"].decode(
+                            "utf-8", errors="replace"
+                        )
+                    except Exception:
+                        report_text = ""
+                    with st.expander("View report", expanded=True):
+                        st.code(report_text or "(unreadable report)", language="json")
+
+                if st.session_state.get("suggested_rules_bytes") is not None:
+                    c1, c2 = st.columns([10, 1])
+                    with c1:
+                        st.markdown("**Suggested rules**")
+                    with c2:
+                        st.download_button(
+                            "⬇",
+                            data=st.session_state["suggested_rules_bytes"],
+                            file_name=st.session_state.get(
+                                "suggested_rules_name", "suggested_rules.json"
+                            ),
+                            mime="application/json",
+                            help="Download suggested rules",
+                            use_container_width=True,
+                        )
+                    try:
+                        suggested_text = st.session_state["suggested_rules_bytes"].decode(
+                            "utf-8", errors="replace"
+                        )
+                    except Exception:
+                        suggested_text = ""
+                    with st.expander("View suggested rules", expanded=True):
+                        st.code(
+                            suggested_text or "(unreadable suggested rules)", language="json"
+                        )
+
             if st.session_state.get("run_in_progress"):
                 st.caption("Updating logs…")
                 time.sleep(0.25)
@@ -159,22 +217,6 @@ def main() -> None:
                 data=st.session_state["result_zip_bytes"],
                 file_name=st.session_state.get("result_zip_name", "anonymized.tar.gz"),
                 mime="application/gzip",
-                width="stretch",
-            )
-        if st.session_state.get("profiling_report_bytes") is not None:
-            st.download_button(
-                "Download profiling report",
-                data=st.session_state["profiling_report_bytes"],
-                file_name=st.session_state.get("profiling_report_name", "profiling_report.json"),
-                mime="application/json",
-                width="stretch",
-            )
-        if st.session_state.get("suggested_rules_bytes") is not None:
-            st.download_button(
-                "Download suggested rules",
-                data=st.session_state["suggested_rules_bytes"],
-                file_name=st.session_state.get("suggested_rules_name", "suggested_rules.json"),
-                mime="application/json",
                 width="stretch",
             )
 
