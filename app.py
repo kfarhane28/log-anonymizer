@@ -254,6 +254,8 @@ def _init_state() -> None:
     st.session_state.setdefault("exclude_editor_df", None)
     st.session_state.setdefault("rules_upload_sig", None)
     st.session_state.setdefault("exclude_upload_sig", None)
+    st.session_state.setdefault("input_upload_sig", None)
+    st.session_state.setdefault("input_upload_path", None)
     st.session_state.setdefault("preview_input", "")
     st.session_state.setdefault("preview_output_value", "")
     st.session_state.setdefault("preview_status", "")
@@ -378,7 +380,7 @@ def _prepare_files(
                 name_hint = str(getattr(uploaded_input, "name", "") or "input.tar.gz")
             else:
                 name_hint = str(getattr(uploaded_input, "name", "") or "input")
-            input_path = _save_upload(tmp_dir, uploaded_input, name_hint=name_hint)
+            input_path = _save_upload_cached(tmp_dir, uploaded_input, name_hint=name_hint)
     else:
         raw = (input_path_text or "").strip()
         input_path = Path(raw).expanduser() if raw else None
@@ -435,12 +437,37 @@ def _ensure_tmp_dir() -> Path:
     return tmp_dir
 
 
-def _save_upload(tmp_dir: Path, uploaded, *, name_hint: str) -> Path:
+def _save_upload_cached(tmp_dir: Path, uploaded, *, name_hint: str) -> Path:
+    """
+    Persist an uploaded file to disk in a stable, content-addressed path.
+
+    Streamlit re-runs the script frequently; without caching, we might overwrite the same
+    on-disk tar.gz while a background worker is reading it (leading to intermittent EOF/ReadError).
+    """
     tmp_dir.mkdir(parents=True, exist_ok=True)
-    target = (tmp_dir / name_hint).resolve()
-    with target.open("wb") as f:
-        f.write(uploaded.getbuffer())
+    raw = bytes(uploaded.getbuffer())
+    safe_name = Path(name_hint).name
+    sig = _sig(safe_name, raw)
+
+    prev_sig = st.session_state.get("input_upload_sig")
+    prev_path = st.session_state.get("input_upload_path")
+    if prev_sig == sig and isinstance(prev_path, str) and prev_path:
+        p = Path(prev_path)
+        if p.exists():
+            return p
+
+    target = (tmp_dir / f"input-{sig[:12]}-{safe_name}").resolve()
+    _atomic_write_bytes(target, raw)
+    st.session_state["input_upload_sig"] = sig
+    st.session_state["input_upload_path"] = str(target)
     return target
+
+
+def _atomic_write_bytes(target: Path, raw: bytes) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_suffix(target.suffix + ".tmp")
+    tmp.write_bytes(raw)
+    os.replace(tmp, target)
 
 
 def _default_output_archive_path(output_dir: Path, input_path: Path) -> Path:
