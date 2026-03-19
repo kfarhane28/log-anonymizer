@@ -16,6 +16,7 @@ from log_anonymizer.exclude_filter import ExcludeFilter, default_patterns, load_
 from log_anonymizer.input_handler import handle_input
 from log_anonymizer.profiling.profiler import ProfilingConfig, SensitiveDataProfiler
 from log_anonymizer.rules_loader import Rule, load_rules
+from log_anonymizer.utils.io import is_text_file
 
 logger = logging.getLogger(__name__)
 
@@ -104,8 +105,6 @@ def process_with_result(
         if cfg.include_builtin_rules
         else user_rules
     )
-    if not rules:
-        raise ValueError("No valid rules loaded; refusing to process.")
 
     tmp_out_dir = Path(tempfile.mkdtemp(prefix="log-anonymizer-out-")).resolve()
     try:
@@ -120,12 +119,21 @@ def process_with_result(
             exclude_filter = _load_exclude_filter(
                 exclude_path, base_dir=working_dir, case_insensitive=cfg.exclude_case_insensitive
             )
-            files = _filter_files(all_files, exclude_filter)
+            included_files, excluded_count = _filter_included_files(all_files, exclude_filter)
+            anonymize_files = [p for p in included_files if _should_anonymize(p, exclude_filter)]
+            passthrough_files = [p for p in included_files if not _should_anonymize(p, exclude_filter)]
 
-            excluded_count = len(all_files) - len(files)
+            if anonymize_files and not rules:
+                raise ValueError("No valid rules loaded; refusing to process.")
+
             logger.info(
                 "pipeline_files_filtered",
-                extra={"to_process": len(files), "excluded": excluded_count, "total": len(all_files)},
+                extra={
+                    "to_process": len(anonymize_files),
+                    "passthrough": len(passthrough_files),
+                    "excluded": excluded_count,
+                    "total": len(all_files),
+                },
             )
 
             profiling_report_path: Path | None = None
@@ -134,7 +142,7 @@ def process_with_result(
                 profiler = SensitiveDataProfiler(
                     config=ProfilingConfig(detectors=cfg.profiling_detectors)
                 )
-                report = profiler.profile_files(files, base_dir=working_dir)
+                report = profiler.profile_files(anonymize_files, base_dir=working_dir)
                 profiling_report_path = (
                     cfg.profiling_report_path
                     or (output_root / "profiling_report.json").resolve()
@@ -157,13 +165,20 @@ def process_with_result(
                     extra={"path": str(suggested_rules_path)},
                 )
 
-            processed, failed = _process_files_parallel(
-                files=files,
+            anonymized_ok, anonymized_failed = _process_files_parallel(
+                files=anonymize_files,
                 working_dir=working_dir,
                 output_dir=tmp_out_dir,
                 rules=rules,
                 max_workers=cfg.max_workers,
             )
+            passthrough_ok, passthrough_failed = _copy_passthrough_files(
+                files=passthrough_files,
+                working_dir=working_dir,
+                output_dir=tmp_out_dir,
+            )
+            processed = anonymized_ok + passthrough_ok
+            failed = anonymized_failed + passthrough_failed
             _tar_gz_dir(tmp_out_dir, out_zip)
     finally:
         shutil.rmtree(tmp_out_dir, ignore_errors=True)
@@ -207,16 +222,52 @@ def _load_exclude_filter(
     )
 
 
-def _filter_files(files: Iterable[Path], exclude_filter: ExcludeFilter | None) -> list[Path]:
+def _is_excluded(path: Path, exclude_filter: ExcludeFilter | None) -> bool:
     if exclude_filter is None:
-        return list(files)
-    out: list[Path] = []
+        return False
+    return exclude_filter.should_exclude(path)
+
+
+def _should_anonymize(path: Path, exclude_filter: ExcludeFilter | None) -> bool:
+    return (not _is_excluded(path, exclude_filter)) and is_text_file(path)
+
+
+def _should_include_in_output(path: Path, exclude_filter: ExcludeFilter | None) -> bool:
+    return not _is_excluded(path, exclude_filter)
+
+
+def _filter_included_files(
+    files: Iterable[Path], exclude_filter: ExcludeFilter | None
+) -> tuple[list[Path], int]:
+    included: list[Path] = []
+    excluded = 0
     for f in files:
-        if exclude_filter.should_exclude(f):
-            # Debug log emitted by ExcludeFilter itself.
-            continue
-        out.append(f)
-    return out
+        if _should_include_in_output(f, exclude_filter):
+            included.append(f)
+        else:
+            excluded += 1
+    return included, excluded
+
+
+def _copy_passthrough_files(*, files: list[Path], working_dir: Path, output_dir: Path) -> tuple[int, int]:
+    if not files:
+        return 0, 0
+
+    copied = 0
+    failed = 0
+
+    for src in files:
+        try:
+            rel = _safe_relative(src, working_dir)
+            dest = output_dir / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dest)
+            copied += 1
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("file_passthrough_error", extra={"src": str(src), "error": str(exc)})
+            failed += 1
+
+    return copied, failed
 
 
 def _process_files_parallel(

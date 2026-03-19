@@ -8,6 +8,7 @@ from pathlib import Path
 from log_anonymizer.exclude_filter import ExcludeFilter, default_patterns, load_patterns
 from log_anonymizer.input_handler import handle_input
 from log_anonymizer.profiling.profiler import ProfilingConfig, SensitiveDataProfiler
+from log_anonymizer.utils.io import is_text_file
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +68,11 @@ def run_sensitive_data_profiling(
             if patterns
             else None
         )
-        files = [f for f in all_files if not (exclude_filter and exclude_filter.should_exclude(f))]
+        files = [
+            f
+            for f in all_files
+            if is_text_file(f) and not (exclude_filter and exclude_filter.should_exclude(f))
+        ]
 
         profiler = SensitiveDataProfiler(config=ProfilingConfig(detectors=detectors))
         report = profiler.profile_files(files, base_dir=working_dir)
@@ -94,4 +99,3 @@ def run_sensitive_data_profiling(
         excluded_files=len(all_files) - len(files),
         profiled_files=len(files),
     )
-

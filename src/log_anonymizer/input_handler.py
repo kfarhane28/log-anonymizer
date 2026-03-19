@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 import logging
 import shutil
 import tempfile
@@ -9,8 +10,6 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
-
-from log_anonymizer.utils.io import is_text_bytes, is_text_file
 
 logger = logging.getLogger(__name__)
 
@@ -90,10 +89,6 @@ def handle_input(input_path: Path) -> Iterator[InputHandlingResult]:
 
         if resolved.is_file():
             logger.info("input_detected", extra={"type": "file", "path": str(resolved)})
-            if not is_text_file(resolved):
-                logger.info("Skipping non-text file: %s", resolved)
-                yield InputHandlingResult(working_dir=resolved.parent, files=[])
-                return
             yield InputHandlingResult(working_dir=resolved.parent, files=[resolved])
             return
 
@@ -123,9 +118,6 @@ def _iter_files(root_dir: Path) -> Iterator[Path]:
                 if entry.is_dir():
                     stack.append(entry)
                 elif entry.is_file():
-                    if not is_text_file(entry):
-                        logger.info("Skipping non-text file: %s", entry)
-                        continue
                     logger.debug("discovered_file", extra={"path": str(entry)})
                     yield entry
         except OSError as exc:
@@ -154,12 +146,7 @@ def _extract_zip_streaming(zip_path: Path, dest_dir: Path) -> None:
 
             target.parent.mkdir(parents=True, exist_ok=True)
             with zf.open(info, "r") as src:
-                head = src.read(8192)
-                if not is_text_bytes(head):
-                    logger.info("Skipping non-text file: %s", zip_path / info.filename)
-                    continue
                 with target.open("wb") as dst:
-                    dst.write(head)
                     shutil.copyfileobj(src, dst, length=1024 * 1024)
 
 
@@ -179,35 +166,139 @@ def _extract_tar_gz_streaming(tar_gz_path: Path, dest_dir: Path) -> None:
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest_root = dest_dir.resolve()
 
-    with tarfile.open(tar_gz_path, mode="r:gz") as tf:
-        for member in tf.getmembers():
-            if member.isdir():
-                continue
-            if not member.isreg():
-                logger.debug(
-                    "skip_non_regular_tar_member",
-                    extra={"member": member.name, "type": member.type},
+    extracted_any = False
+
+    try:
+        with tarfile.open(
+            tar_gz_path,
+            mode="r:gz",
+            ignore_zeros=True,
+            errorlevel=0,
+        ) as tf:
+            extracted_any = _extract_tar_streaming_from_tarfile(
+                tf, tar_gz_path=tar_gz_path, dest_dir=dest_dir, dest_root=dest_root
+            )
+            return
+    except EOFError:
+        logger.warning(
+            "tar_gz_premature_eof_fallback",
+            extra={"path": str(tar_gz_path)},
+        )
+    except (gzip.BadGzipFile, tarfile.ReadError) as exc:
+        raise ValueError(
+            f"Invalid .tar.gz archive (corrupted or truncated): {tar_gz_path}"
+        ) from exc
+
+    extracted_any = _extract_tar_gz_best_effort(
+        tar_gz_path, dest_dir=dest_dir, dest_root=dest_root
+    )
+    if not extracted_any:
+        raise ValueError(f"Invalid .tar.gz archive (corrupted or truncated): {tar_gz_path}")
+
+
+def _extract_tar_gz_best_effort(tar_gz_path: Path, *, dest_dir: Path, dest_root: Path) -> bool:
+    """
+    Best-effort tar.gz extraction for archives that can be extracted by some tar
+    tools but fail strict Python gzip EOF validation.
+
+    This favors making progress (extracting what can be read) over failing hard.
+    """
+
+    class _TolerantGzipReader:
+        def __init__(self, path: Path) -> None:
+            self._gz = gzip.open(path, mode="rb")
+
+        def read(self, size: int = -1) -> bytes:
+            try:
+                return self._gz.read(size)
+            except EOFError:
+                return b""
+
+        def close(self) -> None:
+            self._gz.close()
+
+        def __enter__(self) -> "_TolerantGzipReader":
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:  # noqa: ANN001
+            self.close()
+
+    try:
+        with _TolerantGzipReader(tar_gz_path) as gz:
+            with tarfile.open(
+                fileobj=gz,
+                mode="r|",
+                ignore_zeros=True,
+                errorlevel=0,
+            ) as tf:
+                extracted_any = _extract_tar_streaming_from_tarfile(
+                    tf, tar_gz_path=tar_gz_path, dest_dir=dest_dir, dest_root=dest_root
                 )
-                continue
+                if extracted_any:
+                    logger.warning(
+                        "tar_gz_best_effort_partial",
+                        extra={"path": str(tar_gz_path)},
+                    )
+                return extracted_any
+    except (gzip.BadGzipFile, tarfile.ReadError):
+        return False
 
-            name = member.name
-            # Basic sanity: reject absolute paths and traversal.
-            if name.startswith(("/", "\\")) or ".." in Path(name).parts:
-                raise ValueError(f"Unsafe tar member path: {name}")
 
-            target = (dest_dir / name).resolve()
-            if dest_root not in target.parents and target != dest_root:
-                raise ValueError(f"Unsafe tar member path: {name}")
+def _extract_tar_streaming_from_tarfile(
+    tf: tarfile.TarFile,
+    *,
+    tar_gz_path: Path,
+    dest_dir: Path,
+    dest_root: Path,
+) -> bool:
+    extracted_any = False
 
-            target.parent.mkdir(parents=True, exist_ok=True)
+    while True:
+        try:
+            member = tf.next()
+        except EOFError:
+            break
+        except tarfile.ReadError:
+            break
+
+        if member is None:
+            break
+        if member.isdir():
+            continue
+        if not member.isreg():
+            logger.debug(
+                "skip_non_regular_tar_member",
+                extra={"member": member.name, "type": member.type},
+            )
+            continue
+
+        name = member.name
+        # Basic sanity: reject absolute paths and traversal.
+        if name.startswith(("/", "\\")) or ".." in Path(name).parts:
+            raise ValueError(f"Unsafe tar member path: {name}")
+
+        target = (dest_dir / name).resolve()
+        if dest_root not in target.parents and target != dest_root:
+            raise ValueError(f"Unsafe tar member path: {name}")
+
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
             src = tf.extractfile(member)
-            if src is None:
-                continue
-            with src:
-                head = src.read(8192)
-                if not is_text_bytes(head):
-                    logger.info("Skipping non-text file: %s", tar_gz_path / name)
-                    continue
-                with target.open("wb") as dst:
-                    dst.write(head)
-                    shutil.copyfileobj(src, dst, length=1024 * 1024)
+        except (tarfile.ExtractError, EOFError):
+            break
+        if src is None:
+            continue
+
+        with src:
+            with target.open("wb") as dst:
+                while True:
+                    try:
+                        chunk = src.read(1024 * 1024)
+                    except EOFError:
+                        return extracted_any
+                    if not chunk:
+                        break
+                    dst.write(chunk)
+                    extracted_any = True
+
+    return extracted_any
