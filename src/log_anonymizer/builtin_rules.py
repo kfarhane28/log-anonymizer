@@ -32,41 +32,6 @@ def default_rules() -> list[Rule]:
     """
     rules: list[Rule] = []
 
-    # IP addresses
-    rules.append(_make("IPv4 address", trigger=".", search=r"\b(?:\d{1,3}\.){3}\d{1,3}\b", replace="[IP]"))
-    rules.append(
-        _make(
-            "IPv6 address",
-            trigger=":",
-            # Avoid false positives on timestamps (e.g. 12:50:34), MAC addresses, etc.
-            #
-            # Strategy:
-            # - never match empty hextets except via a `::` compression
-            # - if no `::`, require at least 4 colons (so we don't match short colon tokens)
-            search=r"\b(?!\d{1,2}:\d{2}:\d{2}\b)(?!(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}\b)(?:(?:[0-9A-Fa-f]{1,4}:){4,7}[0-9A-Fa-f]{1,4}|(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4})*)?::(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4})*)?)\b",
-            replace="[IPV6]",
-            case_sensitive=True,
-        )
-    )
-
-    # Kerberos principals: service/host@REALM and user@REALM
-    rules.append(
-        _make(
-            "Kerberos service principal",
-            trigger="@",
-            search=r"\b[A-Za-z0-9._-]+/[A-Za-z0-9._-]+@[A-Za-z0-9._-]+\b",
-            replace="[KRB_PRINCIPAL]",
-        )
-    )
-    rules.append(
-        _make(
-            "Kerberos user principal",
-            trigger="@",
-            search=r"\b[A-Za-z0-9._-]+@[A-Za-z0-9._-]+\b",
-            replace="[KRB_USER]",
-        )
-    )
-
     # Usernames (common conventions)
     rules.append(
         _make(
