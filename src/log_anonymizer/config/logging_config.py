@@ -97,6 +97,8 @@ def _extract_extras(record: logging.LogRecord) -> dict[str, Any]:
     reserved = {
         "name",
         "msg",
+        "message",
+        "asctime",
         "args",
         "levelname",
         "levelno",
