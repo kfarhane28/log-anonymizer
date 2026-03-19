@@ -656,7 +656,9 @@ def _attach_streamlit_logger(q: Queue[str], *, verbose: bool) -> tuple[logging.H
 
     root.setLevel(logging.DEBUG if verbose else logging.INFO)
     handler = _QueueHandler(q, level=logging.DEBUG if verbose else logging.INFO)
-    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    from log_anonymizer.config.logging_config import TextWithExtrasFormatter
+
+    handler.setFormatter(TextWithExtrasFormatter())
     root.addHandler(handler)
 
     return handler, prev

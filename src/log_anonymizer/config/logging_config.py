@@ -43,6 +43,34 @@ class JsonFormatter(logging.Formatter):
         return json.dumps(payload, ensure_ascii=False)
 
 
+class TextWithExtrasFormatter(logging.Formatter):
+    """
+    Human-readable text formatter that appends `extra={...}` fields as key=value.
+
+    This keeps logs scannable while still surfacing structured context like:
+    - file_name, rel, path, dest
+    - reason, count, remaining
+    """
+
+    def __init__(self) -> None:
+        super().__init__("%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+    def format(self, record: logging.LogRecord) -> str:
+        base = super().format(record)
+        extras = _extract_extras(record)
+        if not extras:
+            return base
+
+        parts: list[str] = []
+        for k in sorted(extras.keys()):
+            v = extras[k]
+            if isinstance(v, (dict, list)):
+                parts.append(f"{k}={json.dumps(v, ensure_ascii=False)}")
+            else:
+                parts.append(f"{k}={v}")
+        return f"{base} " + " ".join(parts)
+
+
 def setup_logging(*, level: str = "INFO", log_format: LogFormat = LogFormat.JSON) -> None:
     # Avoid noisy "BrokenPipeError" stack traces when output is piped (e.g., to `head`).
     logging.raiseExceptions = False
@@ -55,9 +83,7 @@ def setup_logging(*, level: str = "INFO", log_format: LogFormat = LogFormat.JSON
     if log_format == LogFormat.JSON:
         handler.setFormatter(JsonFormatter(_LogContext()))
     else:
-        handler.setFormatter(
-            logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
-        )
+        handler.setFormatter(TextWithExtrasFormatter())
 
     root.addHandler(handler)
 
