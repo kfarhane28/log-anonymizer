@@ -166,8 +166,6 @@ def _extract_tar_gz_streaming(tar_gz_path: Path, dest_dir: Path) -> None:
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest_root = dest_dir.resolve()
 
-    extracted_any = False
-
     try:
         with tarfile.open(
             tar_gz_path,
@@ -175,73 +173,14 @@ def _extract_tar_gz_streaming(tar_gz_path: Path, dest_dir: Path) -> None:
             ignore_zeros=True,
             errorlevel=0,
         ) as tf:
-            extracted_any = _extract_tar_streaming_from_tarfile(
+            _extract_tar_streaming_from_tarfile(
                 tf, tar_gz_path=tar_gz_path, dest_dir=dest_dir, dest_root=dest_root
             )
             return
-    except EOFError:
-        logger.warning(
-            "tar_gz_premature_eof_fallback",
-            extra={"path": str(tar_gz_path)},
-        )
-    except (gzip.BadGzipFile, tarfile.ReadError) as exc:
+    except (EOFError, gzip.BadGzipFile, tarfile.ReadError) as exc:
         raise ValueError(
             f"Invalid .tar.gz archive (corrupted or truncated): {tar_gz_path}"
         ) from exc
-
-    extracted_any = _extract_tar_gz_best_effort(
-        tar_gz_path, dest_dir=dest_dir, dest_root=dest_root
-    )
-    if not extracted_any:
-        raise ValueError(f"Invalid .tar.gz archive (corrupted or truncated): {tar_gz_path}")
-
-
-def _extract_tar_gz_best_effort(tar_gz_path: Path, *, dest_dir: Path, dest_root: Path) -> bool:
-    """
-    Best-effort tar.gz extraction for archives that can be extracted by some tar
-    tools but fail strict Python gzip EOF validation.
-
-    This favors making progress (extracting what can be read) over failing hard.
-    """
-
-    class _TolerantGzipReader:
-        def __init__(self, path: Path) -> None:
-            self._gz = gzip.open(path, mode="rb")
-
-        def read(self, size: int = -1) -> bytes:
-            try:
-                return self._gz.read(size)
-            except EOFError:
-                return b""
-
-        def close(self) -> None:
-            self._gz.close()
-
-        def __enter__(self) -> "_TolerantGzipReader":
-            return self
-
-        def __exit__(self, exc_type, exc, tb) -> None:  # noqa: ANN001
-            self.close()
-
-    try:
-        with _TolerantGzipReader(tar_gz_path) as gz:
-            with tarfile.open(
-                fileobj=gz,
-                mode="r|",
-                ignore_zeros=True,
-                errorlevel=0,
-            ) as tf:
-                extracted_any = _extract_tar_streaming_from_tarfile(
-                    tf, tar_gz_path=tar_gz_path, dest_dir=dest_dir, dest_root=dest_root
-                )
-                if extracted_any:
-                    logger.warning(
-                        "tar_gz_best_effort_partial",
-                        extra={"path": str(tar_gz_path)},
-                    )
-                return extracted_any
-    except (gzip.BadGzipFile, tarfile.ReadError):
-        return False
 
 
 def _extract_tar_streaming_from_tarfile(
@@ -256,10 +195,10 @@ def _extract_tar_streaming_from_tarfile(
     while True:
         try:
             member = tf.next()
-        except EOFError:
-            break
-        except tarfile.ReadError:
-            break
+        except EOFError as exc:
+            raise EOFError(f"Unexpected EOF while reading tar members: {tar_gz_path}") from exc
+        except tarfile.ReadError as exc:
+            raise tarfile.ReadError(f"Error while reading tar members: {tar_gz_path}") from exc
 
         if member is None:
             break
@@ -284,8 +223,10 @@ def _extract_tar_streaming_from_tarfile(
         target.parent.mkdir(parents=True, exist_ok=True)
         try:
             src = tf.extractfile(member)
-        except (tarfile.ExtractError, EOFError):
-            break
+        except tarfile.ExtractError as exc:
+            raise tarfile.ExtractError(f"Failed extracting member {name} from {tar_gz_path}") from exc
+        except EOFError as exc:
+            raise EOFError(f"Unexpected EOF extracting member {name} from {tar_gz_path}") from exc
         if src is None:
             continue
 
@@ -294,8 +235,10 @@ def _extract_tar_streaming_from_tarfile(
                 while True:
                     try:
                         chunk = src.read(1024 * 1024)
-                    except EOFError:
-                        return extracted_any
+                    except EOFError as exc:
+                        raise EOFError(
+                            f"Unexpected EOF reading member {name} from {tar_gz_path}"
+                        ) from exc
                     if not chunk:
                         break
                     dst.write(chunk)

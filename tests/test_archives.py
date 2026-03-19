@@ -28,7 +28,7 @@ def test_handle_input_supports_tar_gz(tmp_path: Path) -> None:
         assert files["c.pdf"].read_bytes().startswith(b"%PDF-1.7")
 
 
-def test_handle_input_best_effort_for_truncated_tar_gz(tmp_path: Path) -> None:
+def test_handle_input_rejects_truncated_tar_gz(tmp_path: Path) -> None:
     src_dir = tmp_path / "src"
     src_dir.mkdir()
     # Generate mostly-incompressible (but valid UTF-8) content so truncating the
@@ -49,11 +49,9 @@ def test_handle_input_best_effort_for_truncated_tar_gz(tmp_path: Path) -> None:
     truncated = tmp_path / "bundle-truncated.tar.gz"
     truncated.write_bytes(data[:-100])
 
-    with handle_input(truncated) as prepared:
-        files = [p for p in prepared.files if p.name == "x.log"]
-        assert len(files) == 1
-        extracted = files[0].read_text(encoding="utf-8")
-        assert extracted == "" or extracted.startswith(lines[0])
+    with pytest.raises(ValueError, match=r"Invalid \.tar\.gz archive"):
+        with handle_input(truncated):
+            pass
 
 
 def test_processor_outputs_tar_gz_and_rules_optional(tmp_path: Path) -> None:
