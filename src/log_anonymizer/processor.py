@@ -20,6 +20,16 @@ from log_anonymizer.utils.io import is_text_file
 
 logger = logging.getLogger(__name__)
 
+try:
+    from log_anonymizer.progress import ProgressKind, ProgressReporter, ProgressStage, now_event
+except Exception:  # pragma: no cover
+    ProgressReporter = object  # type: ignore[assignment]
+    ProgressKind = None  # type: ignore[assignment]
+    ProgressStage = None  # type: ignore[assignment]
+
+    def now_event(**kwargs):  # type: ignore[no-redef]
+        raise RuntimeError("progress module unavailable")
+
 
 @dataclass(frozen=True)
 class ProcessorConfig:
@@ -52,6 +62,7 @@ def process(
     output_zip_path: Path | None = None,
     exclude_path: Path | None = None,
     config: ProcessorConfig | None = None,
+    progress: ProgressReporter | None = None,
 ) -> Path:
     return process_with_result(
         input_path=input_path,
@@ -60,6 +71,7 @@ def process(
         output_zip_path=output_zip_path,
         exclude_path=exclude_path,
         config=config,
+        progress=progress,
     ).output_zip
 
 
@@ -71,6 +83,7 @@ def process_with_result(
     output_zip_path: Path | None = None,
     exclude_path: Path | None = None,
     config: ProcessorConfig | None = None,
+    progress: ProgressReporter | None = None,
 ) -> ProcessorResult:
     """
     Main processing pipeline.
@@ -100,6 +113,11 @@ def process_with_result(
     out_zip = _resolve_output_archive_path(output_root, input_path, output_zip_path)
     out_zip.parent.mkdir(parents=True, exist_ok=True)
 
+    if progress is not None:
+        progress.emit(
+            now_event(kind=ProgressKind.STAGE_START, stage=ProgressStage.FINISHED, message="start")
+        )
+
     user_rules = load_rules(rules_path) if rules_path is not None else []
     rules = (
         merge_rules(builtin=default_rules(), user=user_rules)
@@ -109,17 +127,41 @@ def process_with_result(
 
     tmp_out_dir = Path(tempfile.mkdtemp(prefix="log-anonymizer-out-")).resolve()
     try:
-        with handle_input(input_path) as prepared:
+        if progress is not None:
+            progress.emit(
+                now_event(kind=ProgressKind.STAGE_START, stage=ProgressStage.DISCOVERY, message="start")
+            )
+        with handle_input(input_path, progress=progress) as prepared:
             working_dir = prepared.working_dir
             all_files = prepared.files
             logger.info(
                 "pipeline_input_ready",
                 extra={"working_dir": str(working_dir), "files": len(all_files)},
             )
+            if progress is not None:
+                progress.emit(
+                    now_event(
+                        kind=ProgressKind.STAGE_END,
+                        stage=ProgressStage.DISCOVERY,
+                        current=len(all_files),
+                        total=len(all_files),
+                        message="done",
+                    )
+                )
 
             exclude_filter = _load_exclude_filter(
                 exclude_path, base_dir=working_dir, case_insensitive=cfg.exclude_case_insensitive
             )
+            if progress is not None:
+                progress.emit(
+                    now_event(
+                        kind=ProgressKind.STAGE_START,
+                        stage=ProgressStage.FILTERING,
+                        current=0,
+                        total=len(all_files),
+                        message="start",
+                    )
+                )
             included_files, excluded_files = _filter_included_files(all_files, exclude_filter)
             excluded_count = len(excluded_files)
             _log_file_paths(
@@ -156,6 +198,16 @@ def process_with_result(
                     "total": len(all_files),
                 },
             )
+            if progress is not None:
+                progress.emit(
+                    now_event(
+                        kind=ProgressKind.STAGE_END,
+                        stage=ProgressStage.FILTERING,
+                        current=len(included_files),
+                        total=len(all_files),
+                        message=f"included={len(included_files)} excluded={excluded_count}",
+                    )
+                )
 
             profiling_report_path: Path | None = None
             suggested_rules_path: Path | None = None
@@ -186,6 +238,34 @@ def process_with_result(
                     extra={"path": str(suggested_rules_path)},
                 )
 
+            total_in_output = len(included_files)
+            if progress is not None:
+                progress.emit(
+                    now_event(
+                        kind=ProgressKind.STAGE_START,
+                        stage=ProgressStage.PROCESSING,
+                        current=0,
+                        total=total_in_output,
+                        message=f"anonymize={len(anonymize_files)} passthrough={len(passthrough_files)}",
+                    )
+                )
+
+            done_count = 0
+
+            def _on_file_done(ok: bool) -> None:
+                nonlocal done_count
+                done_count += 1
+                if progress is not None:
+                    progress.emit(
+                        now_event(
+                            kind=ProgressKind.STAGE_PROGRESS,
+                            stage=ProgressStage.PROCESSING,
+                            current=done_count,
+                            total=total_in_output,
+                            ok=ok,
+                        )
+                    )
+
             anonymized_ok, anonymized_failed = _process_files_parallel(
                 files=anonymize_files,
                 working_dir=working_dir,
@@ -193,6 +273,8 @@ def process_with_result(
                 rules=rules,
                 parallel_enabled=bool(cfg.parallel_enabled),
                 max_workers=int(cfg.max_workers),
+                progress=progress,
+                on_file_done=_on_file_done,
             )
             passthrough_ok, passthrough_failed = _copy_passthrough_files(
                 files=passthrough_files,
@@ -200,10 +282,39 @@ def process_with_result(
                 output_dir=tmp_out_dir,
                 parallel_enabled=bool(cfg.parallel_enabled),
                 max_workers=int(cfg.max_workers),
+                progress=progress,
+                on_file_done=_on_file_done,
             )
             processed = anonymized_ok + passthrough_ok
             failed = anonymized_failed + passthrough_failed
-            _tar_gz_dir(tmp_out_dir, out_zip)
+            if progress is not None:
+                progress.emit(
+                    now_event(
+                        kind=ProgressKind.STAGE_END,
+                        stage=ProgressStage.PROCESSING,
+                        current=done_count,
+                        total=total_in_output,
+                        message=f"processed={processed} failed={failed}",
+                    )
+                )
+
+            if progress is not None:
+                progress.emit(
+                    now_event(
+                        kind=ProgressKind.STAGE_START,
+                        stage=ProgressStage.ARCHIVE,
+                        message="start",
+                    )
+                )
+            _tar_gz_dir(tmp_out_dir, out_zip, progress=progress)
+            if progress is not None:
+                progress.emit(
+                    now_event(
+                        kind=ProgressKind.STAGE_END,
+                        stage=ProgressStage.ARCHIVE,
+                        message="done",
+                    )
+                )
     finally:
         shutil.rmtree(tmp_out_dir, ignore_errors=True)
 
@@ -218,6 +329,14 @@ def process_with_result(
             "total": len(all_files),
         },
     )
+    if progress is not None:
+        progress.emit(
+            now_event(
+                kind=ProgressKind.STAGE_END,
+                stage=ProgressStage.FINISHED,
+                message="done",
+            )
+        )
     return ProcessorResult(
         output_zip=out_zip,
         total_files=len(all_files),
@@ -280,6 +399,8 @@ def _copy_passthrough_files(
     output_dir: Path,
     parallel_enabled: bool,
     max_workers: int,
+    progress: ProgressReporter | None = None,
+    on_file_done: Callable[[bool], None] | None = None,
 ) -> tuple[int, int]:
     if not files:
         return 0, 0
@@ -289,6 +410,21 @@ def _copy_passthrough_files(
             rel = _safe_relative(src, working_dir)
             dest = output_dir / rel
             dest.parent.mkdir(parents=True, exist_ok=True)
+            if progress is not None:
+                try:
+                    size_bytes = int(src.stat().st_size)
+                except OSError:
+                    size_bytes = None
+                progress.emit(
+                    now_event(
+                        kind=ProgressKind.FILE_START,
+                        stage=ProgressStage.PROCESSING,
+                        path=rel.as_posix(),
+                        bytes_done=0,
+                        bytes_total=size_bytes,
+                        message="passthrough_start",
+                    )
+                )
             logger.info(
                 "file_passthrough_start",
                 extra={
@@ -308,12 +444,32 @@ def _copy_passthrough_files(
                     "dest": str(dest),
                 },
             )
+            if progress is not None:
+                progress.emit(
+                    now_event(
+                        kind=ProgressKind.FILE_END,
+                        stage=ProgressStage.PROCESSING,
+                        path=rel.as_posix(),
+                        ok=True,
+                        message="passthrough_done",
+                    )
+                )
             return True
         except Exception as exc:  # noqa: BLE001
             logger.exception(
                 "file_passthrough_error",
                 extra={"file_name": src.name, "src": str(src), "error": str(exc)},
             )
+            if progress is not None:
+                progress.emit(
+                    now_event(
+                        kind=ProgressKind.FILE_END,
+                        stage=ProgressStage.PROCESSING,
+                        path=_safe_relative(src, working_dir).as_posix(),
+                        ok=False,
+                        message="passthrough_failed",
+                    )
+                )
             return False
 
     return _run_file_workers(
@@ -322,6 +478,7 @@ def _copy_passthrough_files(
         parallel_enabled=parallel_enabled,
         max_workers=max_workers,
         phase="passthrough",
+        on_item_done=on_file_done,
     )
 
 
@@ -375,6 +532,8 @@ def _process_files_parallel(
     rules: list[Rule],
     parallel_enabled: bool,
     max_workers: int,
+    progress: ProgressReporter | None = None,
+    on_file_done: Callable[[bool], None] | None = None,
 ) -> tuple[int, int]:
     if not files:
         return 0, 0
@@ -383,7 +542,11 @@ def _process_files_parallel(
         try:
             rel = _safe_relative(src, working_dir)
             dest = output_dir / rel
-            return anonymize_file(src, dest, rules)
+            try:
+                return anonymize_file(src, dest, rules, progress=progress, rel_path=rel.as_posix())
+            except TypeError:
+                # Backward-compat for monkeypatched / older anonymize_file callables.
+                return anonymize_file(src, dest, rules)
         except Exception as exc:  # noqa: BLE001 (worker boundary)
             logger.exception("file_error", extra={"src": str(src), "error": str(exc)})
             return None
@@ -397,6 +560,7 @@ def _process_files_parallel(
         parallel_enabled=parallel_enabled,
         max_workers=max_workers,
         phase="anonymize",
+        on_item_done=on_file_done,
     )
 
 
@@ -407,6 +571,7 @@ def _run_file_workers(
     parallel_enabled: bool,
     max_workers: int,
     phase: str,
+    on_item_done: Callable[[bool], None] | None = None,
 ) -> tuple[int, int]:
     processed = 0
     failed = 0
@@ -423,6 +588,8 @@ def _run_file_workers(
                 processed += 1
             else:
                 failed += 1
+            if on_item_done is not None:
+                on_item_done(bool(ok))
             if i == 1 or i % 100 == 0 or i == len(files):
                 logger.info(
                     "processing_progress",
@@ -447,6 +614,8 @@ def _run_file_workers(
                 processed += 1
             else:
                 failed += 1
+            if on_item_done is not None:
+                on_item_done(ok)
             if i == 1 or i % 100 == 0 or i == len(files):
                 logger.info(
                     "processing_progress",
@@ -504,14 +673,38 @@ def _archive_base_name(input_path: Path) -> str:
     return p.stem or name
 
 
-def _tar_gz_dir(root_dir: Path, out_tar_gz: Path) -> None:
+def _tar_gz_dir(
+    root_dir: Path, out_tar_gz: Path, *, progress: ProgressReporter | None = None
+) -> None:
     if out_tar_gz.exists():
         out_tar_gz.unlink()
     with tarfile.open(out_tar_gz, mode="w:gz") as tf:
         files = [p for p in root_dir.rglob("*") if p.is_file()]
         files.sort(key=lambda p: p.relative_to(root_dir).as_posix())
-        for p in files:
+        total = len(files)
+        if progress is not None:
+            progress.emit(
+                now_event(
+                    kind=ProgressKind.STAGE_PROGRESS,
+                    stage=ProgressStage.ARCHIVE,
+                    current=0,
+                    total=total,
+                    message="collect",
+                )
+            )
+        for i, p in enumerate(files, start=1):
             # Avoid including the archive itself if user points it inside output_dir.
             if p.resolve() == out_tar_gz.resolve():
                 continue
             tf.add(p, arcname=p.relative_to(root_dir).as_posix(), recursive=False)
+            if progress is not None:
+                if i == 1 or i == total or i % 200 == 0:
+                    progress.emit(
+                        now_event(
+                            kind=ProgressKind.STAGE_PROGRESS,
+                            stage=ProgressStage.ARCHIVE,
+                            current=i,
+                            total=total,
+                            message="writing",
+                        )
+                    )

@@ -27,6 +27,7 @@ from log_anonymizer.application.preview_anonymization import (
 from log_anonymizer.profiling.profiler import ProfilingConfig, SensitiveDataProfiler
 from log_anonymizer.profiling.runner import run_sensitive_data_profiling
 from log_anonymizer.processor import ProcessorConfig, process_with_result
+from log_anonymizer.progress import ProgressEvent, ProgressKind, ProgressStage, QueueProgressReporter
 from log_anonymizer.rules_loader import load_rules
 
 
@@ -116,6 +117,8 @@ def main() -> None:
             st.info(st.session_state["run_status"])
         if st.session_state.get("run_error"):
             st.error(st.session_state["run_error"])
+        if st.session_state.get("run_in_progress"):
+            _render_progress_panel()
 
         logs_tab, rules_tab, exclude_tab, preview_tab = st.tabs(
             ["Logs", "Rules", "Exclude", "Anonymization Preview"]
@@ -235,6 +238,7 @@ def main() -> None:
 def _init_state() -> None:
     st.session_state.setdefault("log_queue", Queue())
     st.session_state.setdefault("outcome_queue", Queue())
+    st.session_state.setdefault("progress_queue", Queue())
     st.session_state.setdefault("log_lines", [])
     st.session_state.setdefault("run_in_progress", False)
     st.session_state.setdefault("run_status", "")
@@ -262,6 +266,15 @@ def _init_state() -> None:
     st.session_state.setdefault("preview_error", "")
     st.session_state.setdefault("preview_profile_report", "")
     st.session_state.setdefault("preview_suggested_rules", "")
+    st.session_state.setdefault("progress_stage", None)
+    st.session_state.setdefault("progress_stage_current", None)
+    st.session_state.setdefault("progress_stage_total", None)
+    st.session_state.setdefault("progress_stage_message", "")
+    st.session_state.setdefault("progress_files_done", 0)
+    st.session_state.setdefault("progress_files_total", None)
+    st.session_state.setdefault("progress_file_path", None)
+    st.session_state.setdefault("progress_file_done", None)
+    st.session_state.setdefault("progress_file_total", None)
     # Backward-compat: older versions used a widget key named "preview_output".
     # Ensure it doesn't linger and cause confusing state errors across hot-reloads.
     st.session_state.pop("preview_output", None)
@@ -494,6 +507,15 @@ def _start_run(run: PreparedRun) -> None:
     st.session_state["suggested_rules_bytes"] = None
     st.session_state["suggested_rules_name"] = None
     st.session_state["log_lines"] = []
+    st.session_state["progress_stage"] = None
+    st.session_state["progress_stage_current"] = None
+    st.session_state["progress_stage_total"] = None
+    st.session_state["progress_stage_message"] = ""
+    st.session_state["progress_files_done"] = 0
+    st.session_state["progress_files_total"] = None
+    st.session_state["progress_file_path"] = None
+    st.session_state["progress_file_done"] = None
+    st.session_state["progress_file_total"] = None
 
     err = _validate_run(run)
     if err:
@@ -505,8 +527,10 @@ def _start_run(run: PreparedRun) -> None:
 
     log_q: Queue[str] = Queue()
     outcome_q: Queue[dict[str, Any]] = Queue()
+    progress_q: Queue[ProgressEvent] = Queue()
     st.session_state["log_queue"] = log_q
     st.session_state["outcome_queue"] = outcome_q
+    st.session_state["progress_queue"] = progress_q
 
     while True:
         try:
@@ -518,13 +542,18 @@ def _start_run(run: PreparedRun) -> None:
             outcome_q.get_nowait()
         except Empty:
             break
+    while True:
+        try:
+            progress_q.get_nowait()
+        except Empty:
+            break
 
     handler, prev = _attach_streamlit_logger(log_q, verbose=run.verbose)
     st.session_state["log_handler"] = handler
     st.session_state["log_prev_handlers"] = prev
 
     thread = threading.Thread(
-        target=_run_pipeline_thread, args=(run, log_q, outcome_q), daemon=True
+        target=_run_pipeline_thread, args=(run, log_q, outcome_q, progress_q), daemon=True
     )
     thread.start()
 
@@ -553,7 +582,10 @@ def _validate_run(run: PreparedRun) -> str | None:
 
 
 def _run_pipeline_thread(
-    run: PreparedRun, log_q: Queue[str], outcome_q: Queue[dict[str, Any]]
+    run: PreparedRun,
+    log_q: Queue[str],
+    outcome_q: Queue[dict[str, Any]],
+    progress_q: Queue[ProgressEvent],
 ) -> None:
     try:
         t0 = time.perf_counter()
@@ -603,12 +635,14 @@ def _run_pipeline_thread(
             profile_sensitive_data=bool(run.profile_sensitive_data),
             profiling_detectors=run.profiling_detectors,
         )
+        reporter = QueueProgressReporter(progress_q)
         out_zip = process_with_result(
             input_path=run.input_path,
             rules_path=run.rules_path,
             output_dir=run.output_dir,
             exclude_path=run.exclude_path,
             config=cfg,
+            progress=reporter,
         )
         elapsed_s = int(round(time.perf_counter() - t0))
         summary_lines = [
@@ -746,7 +780,78 @@ def _pump_logs_once() -> None:
         lines.append(item)
     st.session_state["log_lines"] = lines
 
+    _pump_progress_once()
     _pump_outcome_once()
+
+
+def _pump_progress_once() -> None:
+    q: Queue[ProgressEvent] = st.session_state["progress_queue"]
+    while True:
+        try:
+            ev = q.get_nowait()
+        except Empty:
+            break
+
+        st.session_state["progress_stage"] = ev.stage.value
+        st.session_state["progress_stage_current"] = ev.current
+        st.session_state["progress_stage_total"] = ev.total
+        if ev.message:
+            st.session_state["progress_stage_message"] = ev.message
+
+        if ev.kind == ProgressKind.STAGE_START and ev.stage == ProgressStage.PROCESSING:
+            st.session_state["progress_files_done"] = 0
+            st.session_state["progress_files_total"] = ev.total
+        if ev.kind == ProgressKind.STAGE_PROGRESS and ev.stage == ProgressStage.PROCESSING:
+            if ev.current is not None:
+                st.session_state["progress_files_done"] = ev.current
+            if ev.total is not None:
+                st.session_state["progress_files_total"] = ev.total
+
+        if ev.kind in (ProgressKind.FILE_START, ProgressKind.FILE_PROGRESS, ProgressKind.FILE_END):
+            if ev.path:
+                st.session_state["progress_file_path"] = ev.path
+            st.session_state["progress_file_done"] = ev.bytes_done
+            st.session_state["progress_file_total"] = ev.bytes_total
+
+
+def _render_progress_panel() -> None:
+    stage = st.session_state.get("progress_stage") or ""
+    stage_msg = st.session_state.get("progress_stage_message") or ""
+    cur = st.session_state.get("progress_stage_current")
+    total = st.session_state.get("progress_stage_total")
+
+    files_done = int(st.session_state.get("progress_files_done") or 0)
+    files_total = st.session_state.get("progress_files_total")
+
+    file_path = st.session_state.get("progress_file_path")
+    file_done = st.session_state.get("progress_file_done")
+    file_total = st.session_state.get("progress_file_total")
+
+    st.subheader("Progress")
+
+    if files_total is not None and int(files_total) > 0:
+        frac = min(1.0, float(files_done) / float(files_total))
+        st.progress(frac, text=f"Files: {files_done}/{files_total}")
+    else:
+        st.progress(0.0, text="Files: (waiting)")
+
+    if total is not None and cur is not None and int(total) > 0:
+        frac = min(1.0, float(cur) / float(total))
+        label = f"Stage: {stage} {cur}/{total}"
+        if stage_msg:
+            label += f" ({stage_msg})"
+        st.progress(frac, text=label)
+    else:
+        label = f"Stage: {stage}".strip()
+        if stage_msg:
+            label = (label + f" ({stage_msg})").strip()
+        st.caption(label or "Stage: (waiting)")
+
+    if file_path and file_done is not None and file_total is not None and int(file_total) > 0:
+        frac = min(1.0, float(file_done) / float(file_total))
+        st.progress(frac, text=f"File: {file_path}")
+    elif file_path:
+        st.caption(f"File: {file_path}")
 
 
 def _pump_outcome_once() -> None:

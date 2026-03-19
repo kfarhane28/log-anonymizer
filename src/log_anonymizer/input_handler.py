@@ -5,6 +5,7 @@ import logging
 import shutil
 import tempfile
 import tarfile
+import time
 import zipfile
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -12,6 +13,16 @@ from pathlib import Path
 from typing import Iterator
 
 logger = logging.getLogger(__name__)
+
+try:
+    from log_anonymizer.progress import ProgressKind, ProgressReporter, ProgressStage, now_event
+except Exception:  # pragma: no cover
+    ProgressReporter = object  # type: ignore[assignment]
+    ProgressKind = None  # type: ignore[assignment]
+    ProgressStage = None  # type: ignore[assignment]
+
+    def now_event(**kwargs):  # type: ignore[no-redef]
+        raise RuntimeError("progress module unavailable")
 
 
 @dataclass(frozen=True)
@@ -31,7 +42,7 @@ class InputHandlingResult:
 
 
 @contextmanager
-def handle_input(input_path: Path) -> Iterator[InputHandlingResult]:
+def handle_input(input_path: Path, *, progress: ProgressReporter | None = None) -> Iterator[InputHandlingResult]:
     """
     Prepare an input path (directory, file, or archive) for processing.
 
@@ -59,7 +70,7 @@ def handle_input(input_path: Path) -> Iterator[InputHandlingResult]:
     try:
         if resolved.is_dir():
             logger.info("input_detected", extra={"type": "directory", "path": str(resolved)})
-            files = list(_iter_files(resolved))
+            files = list(_iter_files(resolved, progress=progress))
             logger.info("input_files_listed", extra={"count": len(files)})
             yield InputHandlingResult(working_dir=resolved, files=files)
             return
@@ -68,8 +79,8 @@ def handle_input(input_path: Path) -> Iterator[InputHandlingResult]:
             logger.info("input_detected", extra={"type": "zip", "path": str(resolved)})
             tmp_dir = Path(tempfile.mkdtemp(prefix="log-anonymizer-input-")).resolve()
             logger.debug("zip_extract_start", extra={"zip": str(resolved), "tmp_dir": str(tmp_dir)})
-            _extract_zip_streaming(resolved, tmp_dir)
-            files = list(_iter_files(tmp_dir))
+            _extract_zip_streaming(resolved, tmp_dir, progress=progress)
+            files = list(_iter_files(tmp_dir, progress=progress))
             logger.info("input_files_listed", extra={"count": len(files), "working_dir": str(tmp_dir)})
             yield InputHandlingResult(working_dir=tmp_dir, files=files)
             return
@@ -81,14 +92,24 @@ def handle_input(input_path: Path) -> Iterator[InputHandlingResult]:
                 "tar_extract_start",
                 extra={"tar": str(resolved), "tmp_dir": str(tmp_dir)},
             )
-            _extract_tar_gz_streaming(resolved, tmp_dir)
-            files = list(_iter_files(tmp_dir))
+            _extract_tar_gz_streaming(resolved, tmp_dir, progress=progress)
+            files = list(_iter_files(tmp_dir, progress=progress))
             logger.info("input_files_listed", extra={"count": len(files), "working_dir": str(tmp_dir)})
             yield InputHandlingResult(working_dir=tmp_dir, files=files)
             return
 
         if resolved.is_file():
             logger.info("input_detected", extra={"type": "file", "path": str(resolved)})
+            if progress is not None:
+                progress.emit(
+                    now_event(
+                        kind=ProgressKind.STAGE_PROGRESS,
+                        stage=ProgressStage.DISCOVERY,
+                        current=1,
+                        total=1,
+                        message="single_file",
+                    )
+                )
             yield InputHandlingResult(working_dir=resolved.parent, files=[resolved])
             return
 
@@ -99,7 +120,7 @@ def handle_input(input_path: Path) -> Iterator[InputHandlingResult]:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
-def _iter_files(root_dir: Path) -> Iterator[Path]:
+def _iter_files(root_dir: Path, *, progress: ProgressReporter | None = None) -> Iterator[Path]:
     """
     Recursively yield file paths under root_dir.
 
@@ -107,6 +128,8 @@ def _iter_files(root_dir: Path) -> Iterator[Path]:
     Skips symlinks to avoid potential cycles.
     """
     stack: list[Path] = [root_dir]
+    discovered = 0
+    last_emit = 0.0
     while stack:
         current = stack.pop()
         try:
@@ -119,12 +142,29 @@ def _iter_files(root_dir: Path) -> Iterator[Path]:
                     stack.append(entry)
                 elif entry.is_file():
                     logger.debug("discovered_file", extra={"path": str(entry)})
+                    discovered += 1
+                    if progress is not None:
+                        # Throttle: at most ~5 updates/s and avoid per-file overhead.
+                        now = time.monotonic()
+                        if discovered == 1 or (discovered % 200 == 0) or (now - last_emit) >= 0.2:
+                            last_emit = now
+                            progress.emit(
+                                now_event(
+                                    kind=ProgressKind.STAGE_PROGRESS,
+                                    stage=ProgressStage.DISCOVERY,
+                                    current=discovered,
+                                    total=None,
+                                    message="listing_files",
+                                )
+                            )
                     yield entry
         except OSError as exc:
             logger.debug("skip_unreadable_dir", extra={"path": str(current), "reason": str(exc)})
 
 
-def _extract_zip_streaming(zip_path: Path, dest_dir: Path) -> None:
+def _extract_zip_streaming(
+    zip_path: Path, dest_dir: Path, *, progress: ProgressReporter | None = None
+) -> None:
     """
     Extract `zip_path` into `dest_dir` in a safe, streaming way.
 
@@ -135,11 +175,12 @@ def _extract_zip_streaming(zip_path: Path, dest_dir: Path) -> None:
     dest_root = dest_dir.resolve()
 
     with zipfile.ZipFile(zip_path, "r") as zf:
-        for info in zf.infolist():
+        members = [info for info in zf.infolist() if not info.is_dir()]
+        total = len(members)
+        extracted = 0
+        last_emit = 0.0
+        for info in members:
             # Skip directories; they will be created as needed.
-            if info.is_dir():
-                continue
-
             target = (dest_dir / info.filename).resolve()
             if dest_root not in target.parents and target != dest_root:
                 raise ValueError(f"Unsafe zip member path: {info.filename}")
@@ -148,6 +189,20 @@ def _extract_zip_streaming(zip_path: Path, dest_dir: Path) -> None:
             with zf.open(info, "r") as src:
                 with target.open("wb") as dst:
                     shutil.copyfileobj(src, dst, length=1024 * 1024)
+            extracted += 1
+            if progress is not None:
+                now = time.monotonic()
+                if extracted == 1 or extracted == total or (now - last_emit) >= 0.2:
+                    last_emit = now
+                    progress.emit(
+                        now_event(
+                            kind=ProgressKind.STAGE_PROGRESS,
+                            stage=ProgressStage.DISCOVERY,
+                            current=extracted,
+                            total=total,
+                            message="extracting_zip",
+                        )
+                    )
 
 
 def _is_tar_gz(path: Path) -> bool:
@@ -155,7 +210,9 @@ def _is_tar_gz(path: Path) -> bool:
     return name.endswith(".tar.gz") or name.endswith(".tgz")
 
 
-def _extract_tar_gz_streaming(tar_gz_path: Path, dest_dir: Path) -> None:
+def _extract_tar_gz_streaming(
+    tar_gz_path: Path, dest_dir: Path, *, progress: ProgressReporter | None = None
+) -> None:
     """
     Extract `tar_gz_path` into `dest_dir` in a safe, streaming way.
 
@@ -174,7 +231,11 @@ def _extract_tar_gz_streaming(tar_gz_path: Path, dest_dir: Path) -> None:
             errorlevel=0,
         ) as tf:
             _extract_tar_streaming_from_tarfile(
-                tf, tar_gz_path=tar_gz_path, dest_dir=dest_dir, dest_root=dest_root
+                tf,
+                tar_gz_path=tar_gz_path,
+                dest_dir=dest_dir,
+                dest_root=dest_root,
+                progress=progress,
             )
             return
     except (EOFError, gzip.BadGzipFile, tarfile.ReadError) as exc:
@@ -189,8 +250,11 @@ def _extract_tar_streaming_from_tarfile(
     tar_gz_path: Path,
     dest_dir: Path,
     dest_root: Path,
+    progress: ProgressReporter | None = None,
 ) -> bool:
     extracted_any = False
+    extracted_files = 0
+    last_emit = 0.0
 
     while True:
         try:
@@ -243,5 +307,19 @@ def _extract_tar_streaming_from_tarfile(
                         break
                     dst.write(chunk)
                     extracted_any = True
+        extracted_files += 1
+        if progress is not None:
+            now = time.monotonic()
+            if extracted_files == 1 or (now - last_emit) >= 0.2:
+                last_emit = now
+                progress.emit(
+                    now_event(
+                        kind=ProgressKind.STAGE_PROGRESS,
+                        stage=ProgressStage.DISCOVERY,
+                        current=extracted_files,
+                        total=None,
+                        message="extracting_tar",
+                    )
+                )
 
     return extracted_any

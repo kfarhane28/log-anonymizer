@@ -4,6 +4,7 @@ import argparse
 import signal
 import sys
 from pathlib import Path
+from queue import Queue
 from typing import NoReturn
 
 from log_anonymizer.builtin_rules import default_rules, merge_rules
@@ -13,6 +14,8 @@ from log_anonymizer.exclude_filter import ExcludeFilter, default_patterns, load_
 from log_anonymizer.input_handler import handle_input
 from log_anonymizer.profiling.runner import run_sensitive_data_profiling
 from log_anonymizer.processor import ProcessorConfig, process
+from log_anonymizer.progress import ProgressEvent, ProgressStopToken, QueueProgressReporter
+from log_anonymizer.progress_cli import start_cli_progress_thread
 from log_anonymizer.rules_loader import load_rules
 
 
@@ -102,6 +105,17 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=5,
         help="Max parallel workers when --parallel is enabled (default: 5).",
+    )
+    pg = parser.add_mutually_exclusive_group()
+    pg.add_argument(
+        "--progress",
+        action="store_true",
+        help="Force progress display (writes to stderr).",
+    )
+    pg.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable progress display (useful when redirecting stderr).",
     )
     return parser
 
@@ -201,13 +215,32 @@ def main(argv: list[str] | None = None) -> None:
             if args.suggest_rules_output is not None
             else None,
         )
-        out_zip = process(
-            input_path=input_path,
-            rules_path=rules_path,
-            output_dir=output_path,
-            exclude_path=exclude_path,
-            config=cfg,
+        enable_progress = bool(args.progress) or (
+            not bool(args.no_progress) and sys.stderr.isatty()
         )
+        q: Queue[ProgressEvent] | None = None
+        stop: ProgressStopToken | None = None
+        t = None
+        reporter = None
+        if enable_progress:
+            q = Queue(maxsize=5000)
+            stop = ProgressStopToken()
+            reporter = QueueProgressReporter(q)
+            t = start_cli_progress_thread(q, stop)
+        try:
+            out_zip = process(
+                input_path=input_path,
+                rules_path=rules_path,
+                output_dir=output_path,
+                exclude_path=exclude_path,
+                config=cfg,
+                progress=reporter,
+            )
+        finally:
+            if stop is not None:
+                stop.stop()
+            if t is not None:
+                t.join(timeout=2.0)
         print(str(out_zip))
     except KeyboardInterrupt:
         raise SystemExit(130) from None
