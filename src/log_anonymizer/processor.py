@@ -119,9 +119,29 @@ def process_with_result(
             exclude_filter = _load_exclude_filter(
                 exclude_path, base_dir=working_dir, case_insensitive=cfg.exclude_case_insensitive
             )
-            included_files, excluded_count = _filter_included_files(all_files, exclude_filter)
-            anonymize_files = [p for p in included_files if _should_anonymize(p, exclude_filter)]
-            passthrough_files = [p for p in included_files if not _should_anonymize(p, exclude_filter)]
+            included_files, excluded_files = _filter_included_files(all_files, exclude_filter)
+            excluded_count = len(excluded_files)
+            _log_file_paths(
+                "file_excluded_from_output",
+                excluded_files,
+                working_dir=working_dir,
+                limit=200,
+                extra={"reason": "exclude_match"},
+            )
+            anonymize_files: list[Path] = []
+            passthrough_files: list[Path] = []
+            for p in included_files:
+                if is_text_file(p):
+                    anonymize_files.append(p)
+                else:
+                    passthrough_files.append(p)
+            _log_file_paths(
+                "file_skipped_anonymization_non_text",
+                passthrough_files,
+                working_dir=working_dir,
+                limit=200,
+                extra={"reason": "non_text"},
+            )
 
             if anonymize_files and not rules:
                 raise ValueError("No valid rules loaded; refusing to process.")
@@ -238,14 +258,14 @@ def _should_include_in_output(path: Path, exclude_filter: ExcludeFilter | None) 
 
 def _filter_included_files(
     files: Iterable[Path], exclude_filter: ExcludeFilter | None
-) -> tuple[list[Path], int]:
+) -> tuple[list[Path], list[Path]]:
     included: list[Path] = []
-    excluded = 0
+    excluded: list[Path] = []
     for f in files:
         if _should_include_in_output(f, exclude_filter):
             included.append(f)
         else:
-            excluded += 1
+            excluded.append(f)
     return included, excluded
 
 
@@ -268,6 +288,47 @@ def _copy_passthrough_files(*, files: list[Path], working_dir: Path, output_dir:
             failed += 1
 
     return copied, failed
+
+
+def _log_file_paths(
+    event: str,
+    files: list[Path],
+    *,
+    working_dir: Path,
+    limit: int,
+    extra: dict[str, object] | None = None,
+) -> None:
+    """
+    Log per-file paths for pipeline decisions (exclusion, skipping anonymization, etc.).
+
+    Uses INFO level but caps output to avoid flooding logs on huge support bundles.
+    """
+    if not files:
+        return
+    meta = dict(extra or {})
+    meta.update({"count": len(files), "limit": limit})
+    logger.info(f"{event}_summary", extra=meta)
+
+    shown = 0
+    for p in files:
+        if shown >= limit:
+            break
+        rel = _safe_relative(p, working_dir)
+        logger.info(
+            event,
+            extra={
+                **(extra or {}),
+                "path": str(p),
+                "rel": rel.as_posix(),
+            },
+        )
+        shown += 1
+
+    if len(files) > limit:
+        logger.info(
+            f"{event}_truncated",
+            extra={**(extra or {}), "shown": limit, "remaining": len(files) - limit},
+        )
 
 
 def _process_files_parallel(
