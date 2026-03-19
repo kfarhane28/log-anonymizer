@@ -11,6 +11,7 @@ from log_anonymizer.config.app_config import load_config, resolve_config_path
 from log_anonymizer.config.logging_config import LogFormat, setup_logging
 from log_anonymizer.exclude_filter import ExcludeFilter, default_patterns, load_patterns
 from log_anonymizer.input_handler import handle_input
+from log_anonymizer.profiling.runner import run_sensitive_data_profiling
 from log_anonymizer.processor import ProcessorConfig, process
 from log_anonymizer.rules_loader import load_rules
 
@@ -58,6 +59,28 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable DEBUG logging.")
     parser.add_argument("--exclude-case-insensitive", action="store_true", help="Case-insensitive exclude matching.")
     parser.add_argument("--no-default-rules", action="store_true", help="Do not include built-in Hadoop-sensitive rules.")
+    parser.add_argument(
+        "--profile-sensitive-data",
+        action="store_true",
+        help="Enable optional sensitive-data profiling (heuristic) and rule suggestions.",
+    )
+    parser.add_argument(
+        "--profiling-detectors",
+        default="email,ipv4,token,card",
+        help="Comma-separated detectors to run in profiling mode (default: email,ipv4,token,card).",
+    )
+    parser.add_argument(
+        "--profiling-report",
+        type=Path,
+        default=None,
+        help="Optional path to write profiling report JSON (default: <output>/profiling_report.json).",
+    )
+    parser.add_argument(
+        "--suggest-rules-output",
+        type=Path,
+        default=None,
+        help="Optional path to write suggested rules JSON (default: <output>/suggested_rules.json).",
+    )
     parser.add_argument(
         "--log-level",
         default=None,
@@ -112,6 +135,30 @@ def main(argv: list[str] | None = None) -> None:
 
     try:
         if args.dry_run:
+            detectors = tuple(
+                p.strip()
+                for p in str(args.profiling_detectors or "").split(",")
+                if p.strip()
+            ) or ("email", "ipv4", "token", "card")
+            if args.profile_sensitive_data:
+                res = run_sensitive_data_profiling(
+                    input_path=input_path,
+                    output_dir=output_path,
+                    exclude_path=exclude_path,
+                    exclude_case_insensitive=bool(args.exclude_case_insensitive),
+                    detectors=detectors,
+                    profiling_report_path=args.profiling_report,
+                    suggest_rules_output_path=args.suggest_rules_output,
+                )
+                print("DRY RUN (profiling only)")
+                print(f"- Input: {input_path}")
+                print(f"- Output dir: {output_path}")
+                print(f"- Profiling report: {res.profiling_report_path}")
+                print(f"- Suggested rules: {res.suggested_rules_path}")
+                print(
+                    f"- Files: total={res.total_files}, excluded={res.excluded_files}, profiled={res.profiled_files}"
+                )
+                return
             _dry_run(
                 input_path=input_path,
                 output_dir=output_path,
@@ -122,10 +169,23 @@ def main(argv: list[str] | None = None) -> None:
             )
             return
 
+        detectors = tuple(
+            p.strip()
+            for p in str(args.profiling_detectors or "").split(",")
+            if p.strip()
+        ) or ("email", "ipv4", "token", "card")
         cfg = ProcessorConfig(
             max_workers=8,
             exclude_case_insensitive=bool(args.exclude_case_insensitive),
             include_builtin_rules=not bool(args.no_default_rules),
+            profile_sensitive_data=bool(args.profile_sensitive_data),
+            profiling_detectors=detectors,
+            profiling_report_path=args.profiling_report.resolve()
+            if args.profiling_report is not None
+            else None,
+            suggest_rules_output_path=args.suggest_rules_output.resolve()
+            if args.suggest_rules_output is not None
+            else None,
         )
         out_zip = process(
             input_path=input_path,

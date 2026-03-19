@@ -24,6 +24,8 @@ from log_anonymizer.application.preview_anonymization import (
     PreviewAnonymizationRequest,
     preview_anonymization,
 )
+from log_anonymizer.profiling.profiler import ProfilingConfig, SensitiveDataProfiler
+from log_anonymizer.profiling.runner import run_sensitive_data_profiling
 from log_anonymizer.processor import ProcessorConfig, process_with_result
 from log_anonymizer.rules_loader import load_rules
 
@@ -41,6 +43,8 @@ class PreparedRun:
     output_dir: Path
     verbose: bool
     dry_run: bool
+    profile_sensitive_data: bool
+    profiling_detectors: tuple[str, ...]
 
 
 class _QueueHandler(logging.Handler):
@@ -137,10 +141,19 @@ def main() -> None:
     with right:
         st.subheader("Output")
         st.write(f"Output directory: `{run.output_dir}`")
-        st.write(f"Output archive: `{run.output_dir.with_suffix('.tar.gz')}`")
+        if run.input_path is not None:
+            st.write(f"Output archive: `{_default_output_archive_path(run.output_dir, run.input_path)}`")
+        else:
+            st.write("Output archive: (missing input)")
+
+        has_any_output = any(
+            st.session_state.get(k) is not None
+            for k in ("result_zip_bytes", "profiling_report_bytes", "suggested_rules_bytes")
+        )
+        if has_any_output:
+            st.success("Done.")
 
         if st.session_state.get("result_zip_bytes") is not None:
-            st.success("Done.")
             st.download_button(
                 "Download archive",
                 data=st.session_state["result_zip_bytes"],
@@ -148,10 +161,27 @@ def main() -> None:
                 mime="application/gzip",
                 width="stretch",
             )
+        if st.session_state.get("profiling_report_bytes") is not None:
+            st.download_button(
+                "Download profiling report",
+                data=st.session_state["profiling_report_bytes"],
+                file_name=st.session_state.get("profiling_report_name", "profiling_report.json"),
+                mime="application/json",
+                width="stretch",
+            )
+        if st.session_state.get("suggested_rules_bytes") is not None:
+            st.download_button(
+                "Download suggested rules",
+                data=st.session_state["suggested_rules_bytes"],
+                file_name=st.session_state.get("suggested_rules_name", "suggested_rules.json"),
+                mime="application/json",
+                width="stretch",
+            )
 
         st.subheader("Run")
         st.write(f"Verbose: `{run.verbose}`")
         st.write(f"Dry run: `{run.dry_run}`")
+        st.write(f"Sensitive-data profiling: `{bool(run.profile_sensitive_data)}`")
         st.write(f"Exclude provided: `{bool(run.exclude_path)}`")
         st.write(
             f"Rules file: `{run.rules_path.name if run.rules_path else 'default (built-in only)'}`"
@@ -167,6 +197,10 @@ def _init_state() -> None:
     st.session_state.setdefault("run_error", "")
     st.session_state.setdefault("result_zip_bytes", None)
     st.session_state.setdefault("result_zip_name", None)
+    st.session_state.setdefault("profiling_report_bytes", None)
+    st.session_state.setdefault("profiling_report_name", None)
+    st.session_state.setdefault("suggested_rules_bytes", None)
+    st.session_state.setdefault("suggested_rules_name", None)
     st.session_state.setdefault("tmp_dir", None)
     st.session_state.setdefault("log_handler", None)
     st.session_state.setdefault("log_prev_handlers", None)
@@ -180,6 +214,8 @@ def _init_state() -> None:
     st.session_state.setdefault("preview_output_value", "")
     st.session_state.setdefault("preview_status", "")
     st.session_state.setdefault("preview_error", "")
+    st.session_state.setdefault("preview_profile_report", "")
+    st.session_state.setdefault("preview_suggested_rules", "")
     # Backward-compat: older versions used a widget key named "preview_output".
     # Ensure it doesn't linger and cause confusing state errors across hot-reloads.
     st.session_state.pop("preview_output", None)
@@ -216,6 +252,21 @@ def _render_sidebar() -> PreparedRun:
     output_dir_text = st.sidebar.text_input("Output directory", value="tmp_test/ui_out")
     verbose = st.sidebar.checkbox("Verbose mode (DEBUG)", value=False)
     dry_run = st.sidebar.checkbox("Dry run", value=False)
+    profile_sensitive_data = st.sidebar.checkbox(
+        "Enable sensitive-data profiling (optional)",
+        value=False,
+        help="Heuristic scan for potential sensitive data + suggested rules. Does not change anonymization unless you apply the suggested rules.",
+    )
+    detectors = ("email", "ipv4", "token", "card")
+    profiling_detectors = detectors
+    if profile_sensitive_data:
+        profiling_detectors = tuple(
+            st.sidebar.multiselect(
+                "Profiling detectors",
+                options=list(detectors),
+                default=list(detectors),
+            )
+        ) or detectors
 
     prepared = _prepare_files(
         input_mode=input_mode,
@@ -226,6 +277,8 @@ def _render_sidebar() -> PreparedRun:
         output_dir_text=output_dir_text,
         verbose=verbose,
         dry_run=dry_run,
+        profile_sensitive_data=profile_sensitive_data,
+        profiling_detectors=profiling_detectors,
     )
     if st.session_state.get("ui_errors"):
         st.sidebar.markdown("---")
@@ -246,6 +299,8 @@ def _prepare_files(
     output_dir_text: str,
     verbose: bool,
     dry_run: bool,
+    profile_sensitive_data: bool,
+    profiling_detectors: tuple[str, ...],
 ) -> PreparedRun:
     tmp_dir = _ensure_tmp_dir()
 
@@ -298,6 +353,8 @@ def _prepare_files(
         output_dir=output_dir,
         verbose=verbose,
         dry_run=dry_run,
+        profile_sensitive_data=profile_sensitive_data,
+        profiling_detectors=profiling_detectors,
     )
 
 
@@ -318,10 +375,29 @@ def _save_upload(tmp_dir: Path, uploaded, *, name_hint: str) -> Path:
     return target
 
 
+def _default_output_archive_path(output_dir: Path, input_path: Path) -> Path:
+    out_dir = output_dir.expanduser().resolve()
+    name = input_path.name
+    lower = name.lower()
+    if lower.endswith(".tar.gz"):
+        base = name[: -len(".tar.gz")]
+    elif lower.endswith(".tgz"):
+        base = name[: -len(".tgz")]
+    elif lower.endswith(".zip"):
+        base = input_path.stem
+    else:
+        base = input_path.stem or name
+    return out_dir / f"{base}.tar.gz"
+
+
 def _start_run(run: PreparedRun) -> None:
     st.session_state["run_error"] = ""
     st.session_state["result_zip_bytes"] = None
     st.session_state["result_zip_name"] = None
+    st.session_state["profiling_report_bytes"] = None
+    st.session_state["profiling_report_name"] = None
+    st.session_state["suggested_rules_bytes"] = None
+    st.session_state["suggested_rules_name"] = None
     st.session_state["log_lines"] = []
 
     err = _validate_run(run)
@@ -389,6 +465,31 @@ def _run_pipeline_thread(
             outcome_q.put({"type": "error", "status": "Failed.", "error": "Missing input."})
             return
         if run.dry_run:
+            if run.profile_sensitive_data and run.input_path is not None:
+                res = run_sensitive_data_profiling(
+                    input_path=run.input_path,
+                    output_dir=run.output_dir,
+                    exclude_path=run.exclude_path,
+                    detectors=run.profiling_detectors,
+                )
+                summary = (
+                    "DRY RUN (profiling only)\n"
+                    f"- Profiling report: {res.profiling_report_path}\n"
+                    f"- Suggested rules: {res.suggested_rules_path}\n"
+                    f"- Files: total={res.total_files}, excluded={res.excluded_files}, profiled={res.profiled_files}\n"
+                )
+                log_q.put(summary)
+                outcome_q.put(
+                    {
+                        "type": "done",
+                        "status": "Dry run (profiling only) completed.",
+                        "archive_path": None,
+                        "profiling_report_path": str(res.profiling_report_path),
+                        "suggested_rules_path": str(res.suggested_rules_path),
+                    }
+                )
+                return
+
             summary = _dry_run(run)
             log_q.put(summary)
             outcome_q.put({"type": "done", "status": "Dry run completed.", "archive_path": None})
@@ -398,6 +499,8 @@ def _run_pipeline_thread(
             max_workers=int(os.getenv("LOG_ANONYMIZER_WORKERS", "8")),
             exclude_case_insensitive=False,
             include_builtin_rules=True,
+            profile_sensitive_data=bool(run.profile_sensitive_data),
+            profiling_detectors=run.profiling_detectors,
         )
         out_zip = process_with_result(
             input_path=run.input_path,
@@ -406,19 +509,34 @@ def _run_pipeline_thread(
             exclude_path=run.exclude_path,
             config=cfg,
         )
-        summary = (
-            f"Completed.\n"
-            f"- Output archive: {out_zip.output_zip}\n"
-            f"- Total files: {out_zip.total_files}\n"
-            f"- Excluded: {out_zip.excluded_files}\n"
-            f"- Processed: {out_zip.processed_files}\n"
-            f"- Failed: {out_zip.failed_files}"
+        summary_lines = [
+            "Completed.",
+            f"- Output archive: {out_zip.output_zip}",
+        ]
+        if out_zip.profiling_report_path:
+            summary_lines.append(f"- Profiling report: {out_zip.profiling_report_path}")
+        if out_zip.suggested_rules_path:
+            summary_lines.append(f"- Suggested rules: {out_zip.suggested_rules_path}")
+        summary_lines.extend(
+            [
+                f"- Total files: {out_zip.total_files}",
+                f"- Excluded: {out_zip.excluded_files}",
+                f"- Processed: {out_zip.processed_files}",
+                f"- Failed: {out_zip.failed_files}",
+            ]
         )
+        summary = "\n".join(summary_lines)
         outcome_q.put(
             {
                 "type": "done",
                 "status": summary,
                 "archive_path": str(out_zip.output_zip),
+                "profiling_report_path": str(out_zip.profiling_report_path)
+                if out_zip.profiling_report_path is not None
+                else None,
+                "suggested_rules_path": str(out_zip.suggested_rules_path)
+                if out_zip.suggested_rules_path is not None
+                else None,
                 "summary": {
                     "total": out_zip.total_files,
                     "excluded": out_zip.excluded_files,
@@ -541,6 +659,18 @@ def _pump_outcome_once() -> None:
                 p = Path(archive_path)
                 st.session_state["result_zip_bytes"] = p.read_bytes()
                 st.session_state["result_zip_name"] = p.name
+            profiling_report_path = outcome.get("profiling_report_path")
+            if isinstance(profiling_report_path, str) and profiling_report_path:
+                p = Path(profiling_report_path)
+                if p.exists():
+                    st.session_state["profiling_report_bytes"] = p.read_bytes()
+                    st.session_state["profiling_report_name"] = p.name
+            suggested_rules_path = outcome.get("suggested_rules_path")
+            if isinstance(suggested_rules_path, str) and suggested_rules_path:
+                p = Path(suggested_rules_path)
+                if p.exists():
+                    st.session_state["suggested_rules_bytes"] = p.read_bytes()
+                    st.session_state["suggested_rules_name"] = p.name
             st.session_state["run_in_progress"] = False
             _restore_logger_if_needed()
         elif outcome.get("type") == "error":
@@ -569,7 +699,7 @@ def _render_preview_tab(run: PreparedRun) -> None:
     lines_in = len(text_in.splitlines()) if text_in else 0
     lines_out = len(text_out.splitlines()) if text_out else 0
 
-    b1, b2, _ = st.columns([1.2, 1.0, 6])
+    b1, b2, b3, _ = st.columns([1.2, 1.0, 1.0, 5.0])
     anonymize_clicked = b1.button(
         "Anonymize",
         width="stretch",
@@ -581,6 +711,12 @@ def _render_preview_tab(run: PreparedRun) -> None:
         width="stretch",
         disabled=bool(st.session_state.get("run_in_progress")),
         key="preview_clear_btn",
+    )
+    profile_clicked = b3.button(
+        "Profile",
+        width="stretch",
+        disabled=bool(st.session_state.get("run_in_progress")),
+        key="preview_profile_btn",
     )
 
     if anonymize_clicked:
@@ -606,11 +742,26 @@ def _render_preview_tab(run: PreparedRun) -> None:
             logger.exception("ui_preview_failed", extra={"error": str(exc)})
             st.session_state["preview_error"] = f"{type(exc).__name__}: {exc}"
 
+    if profile_clicked:
+        st.session_state["preview_error"] = ""
+        try:
+            profiler = SensitiveDataProfiler(config=ProfilingConfig(detectors=("email", "ipv4", "token", "card")))
+            report = profiler.profile_text(text_in, source_name="<preview>")
+            st.session_state["preview_profile_report"] = report.to_json()
+            st.session_state["preview_suggested_rules"] = (
+                json.dumps(report.suggested_rules, ensure_ascii=False, indent=2) + "\n"
+            )
+        except Exception as exc:  # noqa: BLE001 (UI boundary)
+            logger.exception("ui_preview_profile_failed", extra={"error": str(exc)})
+            st.session_state["preview_error"] = f"{type(exc).__name__}: {exc}"
+
     if clear_clicked:
         st.session_state["preview_input"] = ""
         st.session_state["preview_output_value"] = ""
         st.session_state["preview_status"] = ""
         st.session_state["preview_error"] = ""
+        st.session_state["preview_profile_report"] = ""
+        st.session_state["preview_suggested_rules"] = ""
         st.rerun()
 
     with status_slot:
@@ -635,6 +786,13 @@ def _render_preview_tab(run: PreparedRun) -> None:
     m1.metric("Input lines", lines_in)
     m2.metric("Output lines", lines_out)
     m3.metric("User rules", _preview_rules_count(run))
+
+    if st.session_state.get("preview_profile_report"):
+        with st.expander("Sensitive-data profiling report (preview)", expanded=False):
+            st.code(st.session_state["preview_profile_report"], language="json")
+    if st.session_state.get("preview_suggested_rules"):
+        with st.expander("Suggested rules (preview)", expanded=False):
+            st.code(st.session_state["preview_suggested_rules"], language="json")
 
     # Optional "Copy" button (best-effort; may depend on browser permissions).
     if text_out:

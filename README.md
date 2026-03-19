@@ -55,8 +55,10 @@ streamlit run app.py
 The UI exposes the same options as the CLI, plus:
 - live logs
 - download button for the resulting archive
+- optional sensitive-data profiling (heuristic) + suggested rules download
 - editable **Rules** and **Exclude** tabs (view/modify uploaded content interactively)
 - **Preview anonymisation** tab to test anonymization on pasted log lines (no files written)
+- If you enable profiling + dry-run, the UI runs profiling only (no archive) and lets you download the report and suggested rules.
 
 In **Preview anonymisation**, paste a small log excerpt, click **Anonymiser**, and review the anonymized output immediately (in-memory; no output files are generated).
 
@@ -117,6 +119,38 @@ log-anonymizer \
   --output anonymized-out \
   --dry-run
 ```
+
+### Optional sensitive-data profiling (heuristic)
+
+You can optionally scan input text logs to detect *potential* sensitive data and generate rule suggestions.
+
+This mode is **OFF by default** and does **not** change anonymization unless you apply the suggested rules.
+
+```bash
+log-anonymizer \
+  --input /path/to/support-bundle.zip \
+  --output anonymized-out \
+  --profile-sensitive-data
+```
+
+Outputs (in addition to the archive):
+- `anonymized-out/profiling_report.json`
+- `anonymized-out/suggested_rules.json`
+
+Profiling-only (no anonymization / no archive):
+
+```bash
+log-anonymizer \
+  --input /path/to/support-bundle.zip \
+  --output anonymized-out \
+  --dry-run \
+  --profile-sensitive-data
+```
+
+Optional flags:
+- `--profiling-detectors email,ipv4,token,card`
+- `--profiling-report /path/to/report.json`
+- `--suggest-rules-output /path/to/suggested_rules.json`
 
 ## Configuration
 

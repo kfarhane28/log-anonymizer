@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import json
 import shutil
 import tarfile
 import tempfile
@@ -13,6 +14,7 @@ from log_anonymizer.anonymizer import AnonymizeFileStats, anonymize_file
 from log_anonymizer.builtin_rules import default_rules, merge_rules
 from log_anonymizer.exclude_filter import ExcludeFilter, default_patterns, load_patterns
 from log_anonymizer.input_handler import handle_input
+from log_anonymizer.profiling.profiler import ProfilingConfig, SensitiveDataProfiler
 from log_anonymizer.rules_loader import Rule, load_rules
 
 logger = logging.getLogger(__name__)
@@ -23,6 +25,10 @@ class ProcessorConfig:
     max_workers: int = 8
     exclude_case_insensitive: bool = False
     include_builtin_rules: bool = True
+    profile_sensitive_data: bool = False
+    profiling_detectors: tuple[str, ...] = ("email", "ipv4", "token", "card")
+    profiling_report_path: Path | None = None
+    suggest_rules_output_path: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -32,6 +38,8 @@ class ProcessorResult:
     processed_files: int
     failed_files: int
     excluded_files: int
+    profiling_report_path: Path | None = None
+    suggested_rules_path: Path | None = None
 
 
 def process(
@@ -120,6 +128,35 @@ def process_with_result(
                 extra={"to_process": len(files), "excluded": excluded_count, "total": len(all_files)},
             )
 
+            profiling_report_path: Path | None = None
+            suggested_rules_path: Path | None = None
+            if cfg.profile_sensitive_data:
+                profiler = SensitiveDataProfiler(
+                    config=ProfilingConfig(detectors=cfg.profiling_detectors)
+                )
+                report = profiler.profile_files(files, base_dir=working_dir)
+                profiling_report_path = (
+                    cfg.profiling_report_path
+                    or (output_root / "profiling_report.json").resolve()
+                )
+                profiling_report_path.write_text(report.to_json(), encoding="utf-8")
+                logger.info(
+                    "profiling_report_written",
+                    extra={"path": str(profiling_report_path)},
+                )
+                suggested_rules_path = (
+                    cfg.suggest_rules_output_path
+                    or (output_root / "suggested_rules.json").resolve()
+                )
+                suggested_rules_path.write_text(
+                    json.dumps(report.suggested_rules, ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+                logger.info(
+                    "suggested_rules_written",
+                    extra={"path": str(suggested_rules_path)},
+                )
+
             processed, failed = _process_files_parallel(
                 files=files,
                 working_dir=working_dir,
@@ -148,6 +185,8 @@ def process_with_result(
         processed_files=processed,
         failed_files=failed,
         excluded_files=excluded_count,
+        profiling_report_path=profiling_report_path,
+        suggested_rules_path=suggested_rules_path,
     )
 
 
