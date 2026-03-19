@@ -529,6 +529,7 @@ def _run_pipeline_thread(
     run: PreparedRun, log_q: Queue[str], outcome_q: Queue[dict[str, Any]]
 ) -> None:
     try:
+        t0 = time.perf_counter()
         if run.input_path is None:
             outcome_q.put({"type": "error", "status": "Failed.", "error": "Missing input."})
             return
@@ -540,10 +541,12 @@ def _run_pipeline_thread(
                     exclude_path=run.exclude_path,
                     detectors=run.profiling_detectors,
                 )
+                elapsed_s = int(round(time.perf_counter() - t0))
                 summary = (
                     "DRY RUN (profiling only)\n"
                     f"- Profiling report: {res.profiling_report_path}\n"
                     f"- Suggested rules: {res.suggested_rules_path}\n"
+                    f"- Duration: {elapsed_s}s\n"
                     f"- Files: total={res.total_files}, excluded={res.excluded_files}, profiled={res.profiled_files}\n"
                 )
                 log_q.put(summary)
@@ -558,7 +561,9 @@ def _run_pipeline_thread(
                 )
                 return
 
+            elapsed_s = int(round(time.perf_counter() - t0))
             summary = _dry_run(run)
+            summary = summary.rstrip("\n") + f"\n- Duration: {elapsed_s}s\n"
             log_q.put(summary)
             outcome_q.put({"type": "done", "status": "Dry run completed.", "archive_path": None})
             return
@@ -578,10 +583,12 @@ def _run_pipeline_thread(
             exclude_path=run.exclude_path,
             config=cfg,
         )
+        elapsed_s = int(round(time.perf_counter() - t0))
         summary_lines = [
             "Completed.",
             f"- Output archive: {out_zip.output_zip}",
         ]
+        summary_lines.append(f"- Duration: {elapsed_s}s")
         if out_zip.profiling_report_path:
             summary_lines.append(f"- Profiling report: {out_zip.profiling_report_path}")
         if out_zip.suggested_rules_path:
