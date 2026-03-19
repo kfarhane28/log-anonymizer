@@ -20,8 +20,9 @@ The project ships with a minimal set of built-in rules (IPs, Kerberos principals
 - Outputs: a single `.tar.gz` archive written inside the `--output` directory (preserves structure)
 - `.exclude` support (glob patterns) to exclude sensitive/binary/large artifacts from both processing and output archive
 - Built-in Hadoop-focused redaction rules + optional user-provided rules (`rules.json`)
+- Optional parallel file processing (off by default; configurable max workers, default 5)
 - Structured logging (JSON) at `INFO` by default (configurable)
-- Streams large files line-by-line (memory efficient); skips likely-binary files
+- Streams large files line-by-line (memory efficient); never anonymizes non-text/binary files (but can include them in the output archive unless excluded)
 
 ## Install
 
@@ -59,6 +60,7 @@ The UI exposes the same options as the CLI, plus:
 - editable **Rules** and **Exclude** tabs (view/modify uploaded content interactively)
 - **Preview anonymisation** tab to test anonymization on pasted log lines (no files written)
 - If you enable profiling + dry-run, the UI runs profiling only (no archive) and lets you download the report and suggested rules.
+- **Performance** controls: enable/disable parallel processing and configure max parallel workers (default 5; can be overridden via `$LOG_ANONYMIZER_WORKERS`).
 
 In **Preview anonymisation**, paste a small log excerpt, click **Anonymiser**, and review the anonymized output immediately (in-memory; no output files are generated).
 
@@ -108,6 +110,25 @@ log-anonymizer \
   --rules examples/rules.json \
   --exclude examples/.exclude
 ```
+
+### Parallel processing (optional)
+
+By default, the tool processes files **sequentially**. For large bundles, you can enable parallel processing:
+
+```bash
+# Parallel mode, default 5 workers
+log-anonymizer --parallel --input /path/to/support-bundle.tar.gz --output anonymized-out
+```
+
+```bash
+# Parallel mode with a custom limit
+log-anonymizer --parallel --max-workers 3 --input /path/to/support-bundle.tar.gz --output anonymized-out
+```
+
+Notes:
+- Parallelism applies to **independent files** (not to lines within a file).
+- The output `.tar.gz` is still built in a single step (no concurrent writes to the archive).
+- File ordering inside the output archive is kept deterministic (sorted by relative path).
 
 ### Dry-run
 
@@ -241,7 +262,8 @@ pytest -q
 
 ## Notes
 
-- This tool processes files as text; it attempts UTF-8 decoding first and falls back to Latin-1.
+- Text files are anonymized; the tool attempts UTF-8 decoding first and falls back to Latin-1.
+- Non-text/binary files are never anonymized; they are included as-is only if not excluded by built-in excludes or your `.exclude`.
 - It streams line-by-line to handle large log files.
 
 ## License

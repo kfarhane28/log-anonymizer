@@ -92,6 +92,17 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Logging format: json or text (overrides config; default: json).",
     )
+    parser.add_argument(
+        "--parallel",
+        action="store_true",
+        help="Enable parallel processing of files (default: disabled, sequential).",
+    )
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=5,
+        help="Max parallel workers when --parallel is enabled (default: 5).",
+    )
     return parser
 
 
@@ -126,6 +137,8 @@ def main(argv: list[str] | None = None) -> None:
         _die(f"Exclude file does not exist: {exclude_path}")
     if args.no_default_rules and rules_path is None:
         _die("--no-default-rules requires providing --rules (otherwise there are no rules to apply).")
+    if args.max_workers is not None and args.max_workers <= 0:
+        _die(f"--max-workers must be >= 1 (got {args.max_workers})")
 
     # Normalize for reproducibility in logs.
     input_path = input_path.resolve()
@@ -175,7 +188,8 @@ def main(argv: list[str] | None = None) -> None:
             if p.strip()
         ) or ("email", "ipv4", "token", "card")
         cfg = ProcessorConfig(
-            max_workers=8,
+            parallel_enabled=bool(args.parallel),
+            max_workers=int(args.max_workers or 5),
             exclude_case_insensitive=bool(args.exclude_case_insensitive),
             include_builtin_rules=not bool(args.no_default_rules),
             profile_sensitive_data=bool(args.profile_sensitive_data),

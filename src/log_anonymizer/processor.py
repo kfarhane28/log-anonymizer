@@ -8,7 +8,7 @@ import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 from log_anonymizer.anonymizer import AnonymizeFileStats, anonymize_file
 from log_anonymizer.builtin_rules import default_rules, merge_rules
@@ -23,7 +23,8 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class ProcessorConfig:
-    max_workers: int = 8
+    parallel_enabled: bool = False
+    max_workers: int = 5
     exclude_case_insensitive: bool = False
     include_builtin_rules: bool = True
     profile_sensitive_data: bool = False
@@ -190,12 +191,15 @@ def process_with_result(
                 working_dir=working_dir,
                 output_dir=tmp_out_dir,
                 rules=rules,
-                max_workers=cfg.max_workers,
+                parallel_enabled=bool(cfg.parallel_enabled),
+                max_workers=int(cfg.max_workers),
             )
             passthrough_ok, passthrough_failed = _copy_passthrough_files(
                 files=passthrough_files,
                 working_dir=working_dir,
                 output_dir=tmp_out_dir,
+                parallel_enabled=bool(cfg.parallel_enabled),
+                max_workers=int(cfg.max_workers),
             )
             processed = anonymized_ok + passthrough_ok
             failed = anonymized_failed + passthrough_failed
@@ -269,14 +273,18 @@ def _filter_included_files(
     return included, excluded
 
 
-def _copy_passthrough_files(*, files: list[Path], working_dir: Path, output_dir: Path) -> tuple[int, int]:
+def _copy_passthrough_files(
+    *,
+    files: list[Path],
+    working_dir: Path,
+    output_dir: Path,
+    parallel_enabled: bool,
+    max_workers: int,
+) -> tuple[int, int]:
     if not files:
         return 0, 0
 
-    copied = 0
-    failed = 0
-
-    for src in files:
+    def _worker(src: Path) -> bool:
         try:
             rel = _safe_relative(src, working_dir)
             dest = output_dir / rel
@@ -300,15 +308,21 @@ def _copy_passthrough_files(*, files: list[Path], working_dir: Path, output_dir:
                     "dest": str(dest),
                 },
             )
-            copied += 1
+            return True
         except Exception as exc:  # noqa: BLE001
             logger.exception(
                 "file_passthrough_error",
                 extra={"file_name": src.name, "src": str(src), "error": str(exc)},
             )
-            failed += 1
+            return False
 
-    return copied, failed
+    return _run_file_workers(
+        files=files,
+        worker=_worker,
+        parallel_enabled=parallel_enabled,
+        max_workers=max_workers,
+        phase="passthrough",
+    )
 
 
 def _log_file_paths(
@@ -359,13 +373,11 @@ def _process_files_parallel(
     working_dir: Path,
     output_dir: Path,
     rules: list[Rule],
+    parallel_enabled: bool,
     max_workers: int,
 ) -> tuple[int, int]:
     if not files:
         return 0, 0
-
-    processed = 0
-    failed = 0
 
     def _worker(src: Path) -> AnonymizeFileStats | None:
         try:
@@ -376,20 +388,69 @@ def _process_files_parallel(
             logger.exception("file_error", extra={"src": str(src), "error": str(exc)})
             return None
 
-    logger.info("processing_start", extra={"files": len(files), "workers": max_workers})
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = {pool.submit(_worker, f): f for f in files}
-        for i, fut in enumerate(as_completed(futures), start=1):
-            res = fut.result()
-            if res is None:
-                failed += 1
-            else:
-                processed += 1
+    def _bool_worker(p: Path) -> bool:
+        return _worker(p) is not None
 
+    return _run_file_workers(
+        files=files,
+        worker=_bool_worker,
+        parallel_enabled=parallel_enabled,
+        max_workers=max_workers,
+        phase="anonymize",
+    )
+
+
+def _run_file_workers(
+    *,
+    files: list[Path],
+    worker: Callable[[Path], bool],
+    parallel_enabled: bool,
+    max_workers: int,
+    phase: str,
+) -> tuple[int, int]:
+    processed = 0
+    failed = 0
+
+    if not parallel_enabled:
+        logger.info(
+            "parallel_mode_disabled",
+            extra={"phase": phase, "mode": "sequential", "files": len(files)},
+        )
+        logger.info("processing_start", extra={"phase": phase, "files": len(files), "workers": 1})
+        for i, f in enumerate(files, start=1):
+            ok = worker(f)
+            if ok:
+                processed += 1
+            else:
+                failed += 1
             if i == 1 or i % 100 == 0 or i == len(files):
                 logger.info(
                     "processing_progress",
-                    extra={"done": i, "total": len(files), "processed": processed, "failed": failed},
+                    extra={"phase": phase, "done": i, "total": len(files), "processed": processed, "failed": failed},
+                )
+        return processed, failed
+
+    if max_workers <= 0:
+        raise ValueError(f"max_workers must be >= 1 (got {max_workers})")
+
+    logger.info(
+        "parallel_mode_enabled",
+        extra={"phase": phase, "mode": "parallel", "max_workers": max_workers, "files": len(files)},
+    )
+    logger.info("processing_start", extra={"phase": phase, "files": len(files), "workers": max_workers})
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = [pool.submit(worker, f) for f in files]
+        for i, fut in enumerate(as_completed(futures), start=1):
+            ok = bool(fut.result())
+            if ok:
+                processed += 1
+            else:
+                failed += 1
+            if i == 1 or i % 100 == 0 or i == len(files):
+                logger.info(
+                    "processing_progress",
+                    extra={"phase": phase, "done": i, "total": len(files), "processed": processed, "failed": failed},
                 )
 
     return processed, failed
@@ -447,9 +508,9 @@ def _tar_gz_dir(root_dir: Path, out_tar_gz: Path) -> None:
     if out_tar_gz.exists():
         out_tar_gz.unlink()
     with tarfile.open(out_tar_gz, mode="w:gz") as tf:
-        for p in root_dir.rglob("*"):
-            if not p.is_file():
-                continue
+        files = [p for p in root_dir.rglob("*") if p.is_file()]
+        files.sort(key=lambda p: p.relative_to(root_dir).as_posix())
+        for p in files:
             # Avoid including the archive itself if user points it inside output_dir.
             if p.resolve() == out_tar_gz.resolve():
                 continue

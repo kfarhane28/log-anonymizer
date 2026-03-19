@@ -45,6 +45,8 @@ class PreparedRun:
     dry_run: bool
     profile_sensitive_data: bool
     profiling_detectors: tuple[str, ...]
+    parallel_enabled: bool
+    max_workers: int
 
 
 class _QueueHandler(logging.Handler):
@@ -294,6 +296,24 @@ def _render_sidebar() -> PreparedRun:
     output_dir_text = st.sidebar.text_input("Output directory", value="tmp_test/ui_out")
     verbose = st.sidebar.checkbox("Verbose mode (DEBUG)", value=False)
     dry_run = st.sidebar.checkbox("Dry run", value=False)
+    st.sidebar.markdown("### Performance")
+    parallel_enabled = st.sidebar.checkbox(
+        "Enable parallel file processing",
+        value=False,
+        help="Processes files concurrently to speed up large bundles. Output is functionally identical.",
+    )
+    default_workers = int(os.getenv("LOG_ANONYMIZER_WORKERS", "5"))
+    max_workers = int(
+        st.sidebar.number_input(
+            "Max parallel workers",
+            min_value=1,
+            max_value=64,
+            value=max(1, min(64, default_workers)),
+            step=1,
+            disabled=not parallel_enabled,
+            help="Only used when parallel processing is enabled (default: 5).",
+        )
+    )
     profile_sensitive_data = st.sidebar.checkbox(
         "Enable sensitive-data profiling (optional)",
         value=False,
@@ -321,6 +341,8 @@ def _render_sidebar() -> PreparedRun:
         dry_run=dry_run,
         profile_sensitive_data=profile_sensitive_data,
         profiling_detectors=profiling_detectors,
+        parallel_enabled=parallel_enabled,
+        max_workers=max_workers,
     )
     if st.session_state.get("ui_errors"):
         st.sidebar.markdown("---")
@@ -343,6 +365,8 @@ def _prepare_files(
     dry_run: bool,
     profile_sensitive_data: bool,
     profiling_detectors: tuple[str, ...],
+    parallel_enabled: bool,
+    max_workers: int,
 ) -> PreparedRun:
     tmp_dir = _ensure_tmp_dir()
 
@@ -397,6 +421,8 @@ def _prepare_files(
         dry_run=dry_run,
         profile_sensitive_data=profile_sensitive_data,
         profiling_detectors=profiling_detectors,
+        parallel_enabled=parallel_enabled,
+        max_workers=int(max_workers),
     )
 
 
@@ -538,7 +564,8 @@ def _run_pipeline_thread(
             return
 
         cfg = ProcessorConfig(
-            max_workers=int(os.getenv("LOG_ANONYMIZER_WORKERS", "8")),
+            parallel_enabled=bool(run.parallel_enabled),
+            max_workers=int(run.max_workers),
             exclude_case_insensitive=False,
             include_builtin_rules=True,
             profile_sensitive_data=bool(run.profile_sensitive_data),
