@@ -63,6 +63,17 @@ def default_rules() -> list[Rule]:
         )
     )
 
+    # Kerberos principals: service/host@REALM (common in Hadoop logs)
+    rules.append(
+        _make(
+            "Kerberos service principal",
+            trigger="@",
+            search=r"\b[A-Za-z0-9._-]+/[A-Za-z0-9._-]+@[A-Za-z0-9._-]+\b",
+            replace="[KRB_PRINCIPAL]",
+            case_sensitive=True,
+        )
+    )
+
     return rules
 
 

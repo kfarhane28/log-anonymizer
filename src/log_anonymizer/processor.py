@@ -281,10 +281,31 @@ def _copy_passthrough_files(*, files: list[Path], working_dir: Path, output_dir:
             rel = _safe_relative(src, working_dir)
             dest = output_dir / rel
             dest.parent.mkdir(parents=True, exist_ok=True)
+            logger.info(
+                "file_passthrough_start",
+                extra={
+                    "file_name": src.name,
+                    "path": str(src),
+                    "rel": rel.as_posix(),
+                    "dest": str(dest),
+                },
+            )
             shutil.copy2(src, dest)
+            logger.info(
+                "file_passthrough_done",
+                extra={
+                    "file_name": src.name,
+                    "path": str(src),
+                    "rel": rel.as_posix(),
+                    "dest": str(dest),
+                },
+            )
             copied += 1
         except Exception as exc:  # noqa: BLE001
-            logger.exception("file_passthrough_error", extra={"src": str(src), "error": str(exc)})
+            logger.exception(
+                "file_passthrough_error",
+                extra={"file_name": src.name, "src": str(src), "error": str(exc)},
+            )
             failed += 1
 
     return copied, failed
@@ -318,6 +339,7 @@ def _log_file_paths(
             event,
             extra={
                 **(extra or {}),
+                "file_name": p.name,
                 "path": str(p),
                 "rel": rel.as_posix(),
             },

@@ -96,7 +96,10 @@ def anonymize_file(input_path: Path, output_path: Path, rules: Iterable[Rule]) -
     rules_list = list(rules)
     acc = _AnonymizationAccumulator(triggered=set(), replacements_by_rule={}, total_replacements=0)
 
-    logger.info("file_start", extra={"input": str(in_path), "output": str(out_path)})
+    logger.info(
+        "file_start",
+        extra={"file_name": in_path.name, "input": str(in_path), "output": str(out_path)},
+    )
     try:
         with _open_text_best_effort(in_path) as fin, out_path.open(
             "w", encoding="utf-8", errors="replace", newline=""
@@ -120,6 +123,7 @@ def anonymize_file(input_path: Path, output_path: Path, rules: Iterable[Rule]) -
     logger.info(
         "file_done",
         extra={
+            "file_name": in_path.name,
             "input": str(in_path),
             "output": str(out_path),
             "replacements": stats.total_replacements,
