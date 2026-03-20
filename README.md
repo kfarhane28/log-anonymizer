@@ -59,10 +59,119 @@ The UI exposes the same options as the CLI, plus:
 - optional sensitive-data profiling (heuristic) + suggested rules download
 - editable **Rules** and **Exclude** tabs (view/modify uploaded content interactively)
 - **Preview anonymisation** tab to test anonymization on pasted log lines (no files written)
+- **Cancel** button during execution (safe stop with consistent output state)
 - If you enable profiling + dry-run, the UI runs profiling only (no archive) and lets you download the report and suggested rules.
 - **Performance** controls: enable/disable parallel processing and configure max parallel workers (default 5; can be overridden via `$LOG_ANONYMIZER_WORKERS`).
 
 In **Preview anonymisation**, paste a small log excerpt, click **Anonymiser**, and review the anonymized output immediately (in-memory; no output files are generated).
+
+## Workflow diagrams (.tar.gz input)
+
+This section explains the end-to-end pipeline used when the input is a `.tar.gz` support bundle.
+Most stages are shared with directory and single-file inputs; the main difference is the extraction/preparation step.
+
+### 1) High-level processing workflow
+
+```mermaid
+flowchart TD
+    A[Receive input: .tar.gz] --> B[Extract archive to temporary working directory]
+    B --> C[Discover files recursively]
+    C --> D[Load built-in exclude patterns]
+    D --> E{User .exclude provided?}
+    E -->|Yes| F[Append user patterns]
+    E -->|No| G[Use built-in patterns only]
+    F --> H[Filter files for output]
+    G --> H
+    H --> I{File is excluded?}
+    I -->|Yes| I1[Skip from processing and output]
+    I -->|No| J{Text file?}
+    J -->|No| J1[Mark as passthrough; keep in output]
+    J -->|Yes| K[Load rules: built-in + rules.json]
+    K --> L{Execution mode}
+    L -->|Sequential| M[Process one file at a time]
+    L -->|Parallel| N[Process files with worker pool]
+    M --> O[Anonymize text files line-by-line]
+    N --> O
+    O --> P[Write each file to temp output file]
+    P --> Q[Atomic rename when file completes]
+    J1 --> R[Copy passthrough files to output staging]
+    Q --> S[Build final .tar.gz archive from staging dir]
+    R --> S
+    S --> T[Cleanup temporary extraction + staging directories]
+    T --> U[Done]
+```
+
+For `.zip`, directory, and single-file inputs, the same filtering/anonymization/output stages are reused; only input preparation differs.
+
+### 2) Decision and optional behavior map
+
+```mermaid
+flowchart TD
+    A[Run starts from CLI or Streamlit UI] --> B{Preview tab?}
+    B -->|Yes (UI)| B1[In-memory anonymization only; no files written] --> Z[Done]
+    B -->|No| C{Dry-run enabled?}
+
+    C -->|Yes| D{Profiling enabled?}
+    D -->|Yes| D1[Profiling-only run: generate profiling_report.json + suggested_rules.json]
+    D -->|No| D2[Show planned files/rules/excludes; no output archive]
+    D1 --> Z
+    D2 --> Z
+
+    C -->|No| E[Normal anonymization pipeline]
+    E --> F{Profile sensitive data?}
+    F -->|Yes| F1[Also write profiling_report.json + suggested_rules.json]
+    F -->|No| G[Skip profiling]
+    F1 --> H
+    G --> H
+
+    H{Parallel enabled?}
+    H -->|Yes (--parallel / UI checkbox)| H1[Concurrent file workers]
+    H -->|No (default)| H2[Sequential file workers]
+    H1 --> I
+    H2 --> I
+
+    I{Per-file outcome}
+    I -->|Success| I1[Include processed file]
+    I -->|Error| I2[Log error and continue with next file]
+    I -->|Excluded| I3[Not included in output]
+    I -->|Non-text and not excluded| I4[Passthrough copy in output]
+    I1 --> J[Create final .tar.gz]
+    I2 --> J
+    I3 --> J
+    I4 --> J
+    J --> K[Cleanup]
+    K --> Z[Done]
+```
+
+This diagram highlights optional branches that are already available in code and flags/options (`--dry-run`, profiling, parallel mode, UI preview).
+
+### 3) Safe cancellation and output consistency
+
+```mermaid
+flowchart TD
+    A[UI run in progress] --> B[User clicks Cancel]
+    B --> C[Shared cancellation token set]
+    C --> D[Scheduler stops accepting new files]
+    D --> E[In-flight file checks token regularly]
+    E --> F{Current file completed?}
+    F -->|No| F1[Discard temp file; do not publish partial file]
+    F -->|Yes| F2[Atomic rename temp file to final path]
+    F1 --> G
+    F2 --> G
+
+    G{Rollback on cancel enabled?}
+    G -->|No (default in UI/CLI)| H[Keep already committed files]
+    G -->|Yes (backend config)| I[Remove generated archive / rollback output]
+    H --> J[Finalize status: Cancelled with partial output kept]
+    I --> K[Finalize status: Cancelled and rolled back]
+
+    L[Any uncaught exception] --> M[Status: Failed]
+    J --> N[Cleanup temporary extraction + staging dirs]
+    K --> N
+    M --> N
+```
+
+Cancellation is cooperative and safe: unfinished files are never partially written, completed files stay valid, and cleanup runs in all terminal states.
 
 ## Usage
 
