@@ -108,7 +108,7 @@ For `.zip`, directory, and single-file inputs, the same filtering/anonymization/
 ```mermaid
 flowchart TD
     A[Run starts from CLI or Streamlit UI] --> B{Preview tab?}
-    B -->|Yes (UI)| B1[In-memory anonymization only; no files written] --> Z[Done]
+    B -->|Yes UI| B1[In-memory anonymization only, no files written] --> Z[Done]
     B -->|No| C{Dry-run enabled?}
 
     C -->|Yes| D{Profiling enabled?}
@@ -125,8 +125,8 @@ flowchart TD
     G --> H
 
     H{Parallel enabled?}
-    H -->|Yes (--parallel / UI checkbox)| H1[Concurrent file workers]
-    H -->|No (default)| H2[Sequential file workers]
+    H -->|Yes parallel enabled| H1[Concurrent file workers]
+    H -->|No default| H2[Sequential file workers]
     H1 --> I
     H2 --> I
 
@@ -160,8 +160,8 @@ flowchart TD
     F2 --> G
 
     G{Rollback on cancel enabled?}
-    G -->|No (default in UI/CLI)| H[Keep already committed files]
-    G -->|Yes (backend config)| I[Remove generated archive / rollback output]
+    G -->|No default| H[Keep already committed files]
+    G -->|Yes backend config| I[Remove generated archive, rollback output]
     H --> J[Finalize status: Cancelled with partial output kept]
     I --> K[Finalize status: Cancelled and rolled back]
 
