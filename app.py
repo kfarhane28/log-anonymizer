@@ -26,7 +26,7 @@ from log_anonymizer.application.preview_anonymization import (
 )
 from log_anonymizer.profiling.profiler import ProfilingConfig, SensitiveDataProfiler
 from log_anonymizer.profiling.runner import run_sensitive_data_profiling
-from log_anonymizer.processor import ProcessorConfig, process_with_result
+from log_anonymizer.processor import CancellationToken, ProcessorConfig, process_with_result
 from log_anonymizer.progress import ProgressEvent, ProgressKind, ProgressStage, QueueProgressReporter
 from log_anonymizer.rules_loader import load_rules
 
@@ -98,13 +98,19 @@ def main() -> None:
     center, right = st.columns([5.5, 1.0], gap="large")
 
     with center:
-        top = st.columns([1.1, 1.6, 8])
+        top = st.columns([1.1, 1.3, 1.6, 8])
         run_clicked = top[0].button("Run", type="primary")
-        clear_clicked = top[1].button(
+        cancel_clicked = top[1].button(
+            "Cancel",
+            disabled=not st.session_state.get("run_in_progress", False),
+        )
+        clear_clicked = top[2].button(
             "Clear log", disabled=st.session_state.get("run_in_progress", False)
         )
         if run_clicked:
             _start_run(run)
+        if cancel_clicked:
+            _request_cancel()
         if clear_clicked:
             st.session_state["log_lines"] = []
             st.session_state["run_error"] = ""
@@ -275,6 +281,7 @@ def _init_state() -> None:
     st.session_state.setdefault("progress_file_path", None)
     st.session_state.setdefault("progress_file_done", None)
     st.session_state.setdefault("progress_file_total", None)
+    st.session_state.setdefault("cancel_token", None)
     # Backward-compat: older versions used a widget key named "preview_output".
     # Ensure it doesn't linger and cause confusing state errors across hot-reloads.
     st.session_state.pop("preview_output", None)
@@ -516,6 +523,7 @@ def _start_run(run: PreparedRun) -> None:
     st.session_state["progress_file_path"] = None
     st.session_state["progress_file_done"] = None
     st.session_state["progress_file_total"] = None
+    st.session_state["cancel_token"] = None
 
     err = _validate_run(run)
     if err:
@@ -524,6 +532,8 @@ def _start_run(run: PreparedRun) -> None:
 
     st.session_state["run_in_progress"] = True
     st.session_state["run_status"] = "Running…"
+    cancel_token = CancellationToken()
+    st.session_state["cancel_token"] = cancel_token
 
     log_q: Queue[str] = Queue()
     outcome_q: Queue[dict[str, Any]] = Queue()
@@ -553,9 +563,22 @@ def _start_run(run: PreparedRun) -> None:
     st.session_state["log_prev_handlers"] = prev
 
     thread = threading.Thread(
-        target=_run_pipeline_thread, args=(run, log_q, outcome_q, progress_q), daemon=True
+        target=_run_pipeline_thread,
+        args=(run, cancel_token, log_q, outcome_q, progress_q),
+        daemon=True,
     )
     thread.start()
+
+
+def _request_cancel() -> None:
+    token = st.session_state.get("cancel_token")
+    if token is None:
+        return
+    try:
+        token.cancel()
+    except Exception:
+        return
+    st.session_state["run_status"] = "Cancellation requested…"
 
 
 def _validate_run(run: PreparedRun) -> str | None:
@@ -583,6 +606,7 @@ def _validate_run(run: PreparedRun) -> str | None:
 
 def _run_pipeline_thread(
     run: PreparedRun,
+    cancel_token: CancellationToken,
     log_q: Queue[str],
     outcome_q: Queue[dict[str, Any]],
     progress_q: Queue[ProgressEvent],
@@ -591,6 +615,17 @@ def _run_pipeline_thread(
         t0 = time.perf_counter()
         if run.input_path is None:
             outcome_q.put({"type": "error", "status": "Failed.", "error": "Missing input."})
+            return
+        if cancel_token.is_cancelled():
+            outcome_q.put(
+                {
+                    "type": "done",
+                    "status": "Cancelled with partial output kept.\n- No output produced.",
+                    "archive_path": None,
+                    "cancelled": True,
+                    "rolled_back": False,
+                }
+            )
             return
         if run.dry_run:
             if run.profile_sensitive_data and run.input_path is not None:
@@ -634,9 +669,11 @@ def _run_pipeline_thread(
             include_builtin_rules=True,
             profile_sensitive_data=bool(run.profile_sensitive_data),
             profiling_detectors=run.profiling_detectors,
+            cancellation_token=cancel_token,
+            rollback_on_cancel=False,
         )
         reporter = QueueProgressReporter(progress_q)
-        out_zip = process_with_result(
+        result = process_with_result(
             input_path=run.input_path,
             rules_path=run.rules_path,
             output_dir=run.output_dir,
@@ -645,21 +682,26 @@ def _run_pipeline_thread(
             progress=reporter,
         )
         elapsed_s = int(round(time.perf_counter() - t0))
-        summary_lines = [
-            "Completed.",
-            f"- Output archive: {out_zip.output_zip}",
-        ]
+        if result.cancelled and result.rolled_back:
+            title = "Cancelled and rolled back."
+        elif result.cancelled:
+            title = "Cancelled with partial output kept."
+        else:
+            title = "Completed."
+        summary_lines = [title]
+        if result.output_zip.exists():
+            summary_lines.append(f"- Output archive: {result.output_zip}")
         summary_lines.append(f"- Duration: {elapsed_s}s")
-        if out_zip.profiling_report_path:
-            summary_lines.append(f"- Profiling report: {out_zip.profiling_report_path}")
-        if out_zip.suggested_rules_path:
-            summary_lines.append(f"- Suggested rules: {out_zip.suggested_rules_path}")
+        if result.profiling_report_path:
+            summary_lines.append(f"- Profiling report: {result.profiling_report_path}")
+        if result.suggested_rules_path:
+            summary_lines.append(f"- Suggested rules: {result.suggested_rules_path}")
         summary_lines.extend(
             [
-                f"- Total files: {out_zip.total_files}",
-                f"- Excluded: {out_zip.excluded_files}",
-                f"- Processed: {out_zip.processed_files}",
-                f"- Failed: {out_zip.failed_files}",
+                f"- Total files: {result.total_files}",
+                f"- Excluded: {result.excluded_files}",
+                f"- Processed: {result.processed_files}",
+                f"- Failed: {result.failed_files}",
             ]
         )
         summary = "\n".join(summary_lines)
@@ -667,18 +709,20 @@ def _run_pipeline_thread(
             {
                 "type": "done",
                 "status": summary,
-                "archive_path": str(out_zip.output_zip),
-                "profiling_report_path": str(out_zip.profiling_report_path)
-                if out_zip.profiling_report_path is not None
+                "archive_path": str(result.output_zip) if result.output_zip.exists() else None,
+                "profiling_report_path": str(result.profiling_report_path)
+                if result.profiling_report_path is not None
                 else None,
-                "suggested_rules_path": str(out_zip.suggested_rules_path)
-                if out_zip.suggested_rules_path is not None
+                "suggested_rules_path": str(result.suggested_rules_path)
+                if result.suggested_rules_path is not None
                 else None,
+                "cancelled": bool(result.cancelled),
+                "rolled_back": bool(result.rolled_back),
                 "summary": {
-                    "total": out_zip.total_files,
-                    "excluded": out_zip.excluded_files,
-                    "processed": out_zip.processed_files,
-                    "failed": out_zip.failed_files,
+                    "total": result.total_files,
+                    "excluded": result.excluded_files,
+                    "processed": result.processed_files,
+                    "failed": result.failed_files,
                 },
             }
         )
@@ -867,8 +911,12 @@ def _pump_outcome_once() -> None:
             archive_path = outcome.get("archive_path")
             if isinstance(archive_path, str) and archive_path:
                 p = Path(archive_path)
-                st.session_state["result_zip_bytes"] = p.read_bytes()
-                st.session_state["result_zip_name"] = p.name
+                if p.exists():
+                    st.session_state["result_zip_bytes"] = p.read_bytes()
+                    st.session_state["result_zip_name"] = p.name
+                else:
+                    st.session_state["result_zip_bytes"] = None
+                    st.session_state["result_zip_name"] = None
             profiling_report_path = outcome.get("profiling_report_path")
             if isinstance(profiling_report_path, str) and profiling_report_path:
                 p = Path(profiling_report_path)
@@ -882,11 +930,13 @@ def _pump_outcome_once() -> None:
                     st.session_state["suggested_rules_bytes"] = p.read_bytes()
                     st.session_state["suggested_rules_name"] = p.name
             st.session_state["run_in_progress"] = False
+            st.session_state["cancel_token"] = None
             _restore_logger_if_needed()
         elif outcome.get("type") == "error":
             st.session_state["run_status"] = str(outcome.get("status") or "Failed.")
             st.session_state["run_error"] = str(outcome.get("error") or "Unknown error")
             st.session_state["run_in_progress"] = False
+            st.session_state["cancel_token"] = None
             _restore_logger_if_needed()
 
 

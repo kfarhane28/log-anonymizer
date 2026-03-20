@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import logging
+import os
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Iterator, TextIO
+from typing import Callable, Iterable, Iterator, TextIO
 
 from log_anonymizer.rules_loader import Rule
 from log_anonymizer.utils.io import is_text_file
@@ -43,6 +45,10 @@ class _AnonymizationAccumulator:
     triggered: set[str]
     replacements_by_rule: dict[str, int]
     total_replacements: int
+
+
+class AnonymizationCancelled(Exception):
+    """Raised when anonymization is cancelled before output is committed."""
 
 
 def anonymize_text_block(text: str, rules: Iterable[Rule]) -> tuple[str, AnonymizeTextStats]:
@@ -96,6 +102,7 @@ def anonymize_file(
     rel_path: str | None = None,
     progress_min_bytes: int = 5 * 1024 * 1024,
     progress_min_interval_s: float = 0.2,
+    cancel_requested: Callable[[], bool] | None = None,
 ) -> AnonymizeFileStats:
     """
     Anonymize a log file line-by-line using the provided rules.
@@ -137,12 +144,21 @@ def anonymize_file(
         "file_start",
         extra={"file_name": in_path.name, "input": str(in_path), "output": str(out_path)},
     )
+    tmp_fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{out_path.name}.",
+        suffix=".tmp",
+        dir=str(out_path.parent),
+    )
+    os.close(tmp_fd)
+    tmp_out_path = Path(tmp_name)
     try:
-        with _open_text_best_effort(in_path) as fin, out_path.open(
+        with _open_text_best_effort(in_path) as fin, tmp_out_path.open(
             "w", encoding="utf-8", errors="replace", newline=""
         ) as fout:
             last_emit = 0.0
             for new_line in _iter_anonymized_lines(fin, rules_list, acc):
+                if cancel_requested is not None and cancel_requested():
+                    raise AnonymizationCancelled(f"cancelled while processing {in_path}")
                 fout.write(new_line)
                 if (
                     progress is not None
@@ -169,6 +185,29 @@ def anonymize_file(
                                     bytes_total=size_bytes,
                                 )
                             )
+        # Write to a temp file first, then atomically replace the target only when complete.
+        # This guarantees no partial/corrupted output for the currently processed file.
+        if cancel_requested is not None and cancel_requested():
+            raise AnonymizationCancelled(f"cancelled before commit for {in_path}")
+        os.replace(tmp_out_path, out_path)
+    except AnonymizationCancelled:
+        logger.info(
+            "file_cancelled",
+            extra={"input": str(in_path), "output": str(out_path)},
+        )
+        if progress is not None:
+            progress.emit(
+                now_event(
+                    kind=ProgressKind.FILE_END,
+                    stage=ProgressStage.PROCESSING,
+                    path=rel_path or in_path.name,
+                    bytes_done=size_bytes,
+                    bytes_total=size_bytes,
+                    ok=False,
+                    message="anonymize_cancelled",
+                )
+            )
+        raise
     except OSError as exc:
         logger.exception(
             "file_failed",
@@ -187,6 +226,12 @@ def anonymize_file(
                 )
             )
         raise
+    finally:
+        try:
+            if tmp_out_path.exists():
+                tmp_out_path.unlink()
+        except OSError:
+            pass
 
     stats = AnonymizeFileStats(
         input_path=in_path,

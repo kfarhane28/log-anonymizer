@@ -2,15 +2,20 @@ from __future__ import annotations
 
 import logging
 import json
+import os
 import shutil
 import tarfile
 import tempfile
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable
+from threading import Event
+from typing import Callable, Iterable, Literal
 
-from log_anonymizer.anonymizer import AnonymizeFileStats, anonymize_file
+from log_anonymizer.anonymizer import (
+    AnonymizationCancelled,
+    anonymize_file,
+)
 from log_anonymizer.builtin_rules import default_rules, merge_rules
 from log_anonymizer.exclude_filter import ExcludeFilter, default_patterns, load_patterns
 from log_anonymizer.input_handler import handle_input
@@ -41,6 +46,8 @@ class ProcessorConfig:
     profiling_detectors: tuple[str, ...] = ("email", "ipv4", "token", "card")
     profiling_report_path: Path | None = None
     suggest_rules_output_path: Path | None = None
+    cancellation_token: "CancellationToken | None" = None
+    rollback_on_cancel: bool = False
 
 
 @dataclass(frozen=True)
@@ -52,6 +59,24 @@ class ProcessorResult:
     excluded_files: int
     profiling_report_path: Path | None = None
     suggested_rules_path: Path | None = None
+    cancelled: bool = False
+    rolled_back: bool = False
+
+
+class CancellationToken:
+    """Thread-safe cancellation flag shared across UI and processing workers."""
+
+    def __init__(self) -> None:
+        self._event = Event()
+
+    def cancel(self) -> None:
+        self._event.set()
+
+    def is_cancelled(self) -> bool:
+        return self._event.is_set()
+
+
+WorkerOutcome = Literal["processed", "failed", "cancelled"]
 
 
 def process(
@@ -105,6 +130,15 @@ def process_with_result(
         ProcessorResult including generated archive file path.
     """
     cfg = config or ProcessorConfig()
+    cancelled = False
+    rolled_back = False
+    all_files: list[Path] = []
+    processed = 0
+    failed = 0
+    excluded_count = 0
+    profiling_report_path: Path | None = None
+    suggested_rules_path: Path | None = None
+
     output_root = output_dir.expanduser().resolve()
     if output_root.exists() and not output_root.is_dir():
         raise ValueError(f"--output must be a directory: {output_root}")
@@ -209,9 +243,7 @@ def process_with_result(
                     )
                 )
 
-            profiling_report_path: Path | None = None
-            suggested_rules_path: Path | None = None
-            if cfg.profile_sensitive_data:
+            if cfg.profile_sensitive_data and not _is_cancelled(cfg):
                 profiler = SensitiveDataProfiler(
                     config=ProfilingConfig(detectors=cfg.profiling_detectors)
                 )
@@ -237,6 +269,8 @@ def process_with_result(
                     "suggested_rules_written",
                     extra={"path": str(suggested_rules_path)},
                 )
+            elif _is_cancelled(cfg):
+                cancelled = True
 
             total_in_output = len(included_files)
             if progress is not None:
@@ -266,7 +300,7 @@ def process_with_result(
                         )
                     )
 
-            anonymized_ok, anonymized_failed = _process_files_parallel(
+            anonymized_ok, anonymized_failed, anonymized_cancelled = _process_files_parallel(
                 files=anonymize_files,
                 working_dir=working_dir,
                 output_dir=tmp_out_dir,
@@ -275,16 +309,26 @@ def process_with_result(
                 max_workers=int(cfg.max_workers),
                 progress=progress,
                 on_file_done=_on_file_done,
+                cancel_requested=lambda: _is_cancelled(cfg),
             )
-            passthrough_ok, passthrough_failed = _copy_passthrough_files(
-                files=passthrough_files,
-                working_dir=working_dir,
-                output_dir=tmp_out_dir,
-                parallel_enabled=bool(cfg.parallel_enabled),
-                max_workers=int(cfg.max_workers),
-                progress=progress,
-                on_file_done=_on_file_done,
-            )
+            cancelled = cancelled or anonymized_cancelled > 0 or _is_cancelled(cfg)
+
+            passthrough_ok = 0
+            passthrough_failed = 0
+            passthrough_cancelled = 0
+            if not cancelled:
+                passthrough_ok, passthrough_failed, passthrough_cancelled = _copy_passthrough_files(
+                    files=passthrough_files,
+                    working_dir=working_dir,
+                    output_dir=tmp_out_dir,
+                    parallel_enabled=bool(cfg.parallel_enabled),
+                    max_workers=int(cfg.max_workers),
+                    progress=progress,
+                    on_file_done=_on_file_done,
+                    cancel_requested=lambda: _is_cancelled(cfg),
+                )
+                cancelled = cancelled or passthrough_cancelled > 0 or _is_cancelled(cfg)
+
             processed = anonymized_ok + passthrough_ok
             failed = anonymized_failed + passthrough_failed
             if progress is not None:
@@ -294,27 +338,45 @@ def process_with_result(
                         stage=ProgressStage.PROCESSING,
                         current=done_count,
                         total=total_in_output,
-                        message=f"processed={processed} failed={failed}",
+                        message=f"processed={processed} failed={failed} cancelled={int(cancelled)}",
                     )
                 )
 
-            if progress is not None:
-                progress.emit(
-                    now_event(
-                        kind=ProgressKind.STAGE_START,
-                        stage=ProgressStage.ARCHIVE,
-                        message="start",
+            if cancelled and cfg.rollback_on_cancel:
+                rolled_back = True
+                if out_zip.exists():
+                    out_zip.unlink()
+            else:
+                if progress is not None:
+                    progress.emit(
+                        now_event(
+                            kind=ProgressKind.STAGE_START,
+                            stage=ProgressStage.ARCHIVE,
+                            message="start",
+                        )
                     )
-                )
-            _tar_gz_dir(tmp_out_dir, out_zip, progress=progress)
-            if progress is not None:
-                progress.emit(
-                    now_event(
-                        kind=ProgressKind.STAGE_END,
-                        stage=ProgressStage.ARCHIVE,
-                        message="done",
+                try:
+                    # If cancellation happened during processing, finalize a partial archive.
+                    archive_cancel = (lambda: _is_cancelled(cfg)) if not cancelled else None
+                    _tar_gz_dir(
+                        tmp_out_dir,
+                        out_zip,
+                        progress=progress,
+                        cancel_requested=archive_cancel,
                     )
-                )
+                except AnonymizationCancelled:
+                    cancelled = True
+                    rolled_back = True
+                    if out_zip.exists():
+                        out_zip.unlink()
+                if progress is not None:
+                    progress.emit(
+                        now_event(
+                            kind=ProgressKind.STAGE_END,
+                            stage=ProgressStage.ARCHIVE,
+                            message="done" if not rolled_back else "cancelled",
+                        )
+                    )
     finally:
         shutil.rmtree(tmp_out_dir, ignore_errors=True)
 
@@ -327,6 +389,8 @@ def process_with_result(
             "failed": failed,
             "excluded": excluded_count,
             "total": len(all_files),
+            "cancelled": cancelled,
+            "rolled_back": rolled_back,
         },
     )
     if progress is not None:
@@ -345,7 +409,14 @@ def process_with_result(
         excluded_files=excluded_count,
         profiling_report_path=profiling_report_path,
         suggested_rules_path=suggested_rules_path,
+        cancelled=cancelled,
+        rolled_back=rolled_back,
     )
+
+
+def _is_cancelled(cfg: ProcessorConfig) -> bool:
+    token = cfg.cancellation_token
+    return bool(token is not None and token.is_cancelled())
 
 
 def _load_exclude_filter(
@@ -401,12 +472,15 @@ def _copy_passthrough_files(
     max_workers: int,
     progress: ProgressReporter | None = None,
     on_file_done: Callable[[bool], None] | None = None,
-) -> tuple[int, int]:
+    cancel_requested: Callable[[], bool] | None = None,
+) -> tuple[int, int, int]:
     if not files:
-        return 0, 0
+        return 0, 0, 0
 
-    def _worker(src: Path) -> bool:
+    def _worker(src: Path) -> WorkerOutcome:
         try:
+            if cancel_requested is not None and cancel_requested():
+                return "cancelled"
             rel = _safe_relative(src, working_dir)
             dest = output_dir / rel
             dest.parent.mkdir(parents=True, exist_ok=True)
@@ -434,7 +508,19 @@ def _copy_passthrough_files(
                     "dest": str(dest),
                 },
             )
-            shutil.copy2(src, dest)
+            committed = _copy_file_atomic(src, dest, cancel_requested=cancel_requested)
+            if not committed:
+                if progress is not None:
+                    progress.emit(
+                        now_event(
+                            kind=ProgressKind.FILE_END,
+                            stage=ProgressStage.PROCESSING,
+                            path=rel.as_posix(),
+                            ok=False,
+                            message="passthrough_cancelled",
+                        )
+                    )
+                return "cancelled"
             logger.info(
                 "file_passthrough_done",
                 extra={
@@ -454,7 +540,7 @@ def _copy_passthrough_files(
                         message="passthrough_done",
                     )
                 )
-            return True
+            return "processed"
         except Exception as exc:  # noqa: BLE001
             logger.exception(
                 "file_passthrough_error",
@@ -470,7 +556,7 @@ def _copy_passthrough_files(
                         message="passthrough_failed",
                     )
                 )
-            return False
+            return "failed"
 
     return _run_file_workers(
         files=files,
@@ -479,6 +565,7 @@ def _copy_passthrough_files(
         max_workers=max_workers,
         phase="passthrough",
         on_item_done=on_file_done,
+        cancel_requested=cancel_requested,
     )
 
 
@@ -534,47 +621,60 @@ def _process_files_parallel(
     max_workers: int,
     progress: ProgressReporter | None = None,
     on_file_done: Callable[[bool], None] | None = None,
-) -> tuple[int, int]:
+    cancel_requested: Callable[[], bool] | None = None,
+) -> tuple[int, int, int]:
     if not files:
-        return 0, 0
+        return 0, 0, 0
 
-    def _worker(src: Path) -> AnonymizeFileStats | None:
+    def _worker(src: Path) -> WorkerOutcome:
         try:
+            if cancel_requested is not None and cancel_requested():
+                return "cancelled"
             rel = _safe_relative(src, working_dir)
             dest = output_dir / rel
             try:
-                return anonymize_file(src, dest, rules, progress=progress, rel_path=rel.as_posix())
+                anonymize_file(
+                    src,
+                    dest,
+                    rules,
+                    progress=progress,
+                    rel_path=rel.as_posix(),
+                    cancel_requested=cancel_requested,
+                )
             except TypeError:
                 # Backward-compat for monkeypatched / older anonymize_file callables.
-                return anonymize_file(src, dest, rules)
+                anonymize_file(src, dest, rules)
+            return "processed"
+        except AnonymizationCancelled:
+            return "cancelled"
         except Exception as exc:  # noqa: BLE001 (worker boundary)
             logger.exception("file_error", extra={"src": str(src), "error": str(exc)})
-            return None
-
-    def _bool_worker(p: Path) -> bool:
-        return _worker(p) is not None
+            return "failed"
 
     return _run_file_workers(
         files=files,
-        worker=_bool_worker,
+        worker=_worker,
         parallel_enabled=parallel_enabled,
         max_workers=max_workers,
         phase="anonymize",
         on_item_done=on_file_done,
+        cancel_requested=cancel_requested,
     )
 
 
 def _run_file_workers(
     *,
     files: list[Path],
-    worker: Callable[[Path], bool],
+    worker: Callable[[Path], WorkerOutcome],
     parallel_enabled: bool,
     max_workers: int,
     phase: str,
     on_item_done: Callable[[bool], None] | None = None,
-) -> tuple[int, int]:
+    cancel_requested: Callable[[], bool] | None = None,
+) -> tuple[int, int, int]:
     processed = 0
     failed = 0
+    cancelled = 0
 
     if not parallel_enabled:
         logger.info(
@@ -583,19 +683,31 @@ def _run_file_workers(
         )
         logger.info("processing_start", extra={"phase": phase, "files": len(files), "workers": 1})
         for i, f in enumerate(files, start=1):
-            ok = worker(f)
-            if ok:
+            if cancel_requested is not None and cancel_requested():
+                cancelled += len(files) - (i - 1)
+                break
+            outcome = worker(f)
+            if outcome == "processed":
                 processed += 1
-            else:
+            elif outcome == "failed":
                 failed += 1
+            else:
+                cancelled += 1
             if on_item_done is not None:
-                on_item_done(bool(ok))
+                on_item_done(outcome == "processed")
             if i == 1 or i % 100 == 0 or i == len(files):
                 logger.info(
                     "processing_progress",
-                    extra={"phase": phase, "done": i, "total": len(files), "processed": processed, "failed": failed},
+                    extra={
+                        "phase": phase,
+                        "done": i,
+                        "total": len(files),
+                        "processed": processed,
+                        "failed": failed,
+                        "cancelled": cancelled,
+                    },
                 )
-        return processed, failed
+        return processed, failed, cancelled
 
     if max_workers <= 0:
         raise ValueError(f"max_workers must be >= 1 (got {max_workers})")
@@ -607,22 +719,95 @@ def _run_file_workers(
     logger.info("processing_start", extra={"phase": phase, "files": len(files), "workers": max_workers})
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = [pool.submit(worker, f) for f in files]
-        for i, fut in enumerate(as_completed(futures), start=1):
-            ok = bool(fut.result())
-            if ok:
-                processed += 1
-            else:
-                failed += 1
-            if on_item_done is not None:
-                on_item_done(ok)
-            if i == 1 or i % 100 == 0 or i == len(files):
-                logger.info(
-                    "processing_progress",
-                    extra={"phase": phase, "done": i, "total": len(files), "processed": processed, "failed": failed},
-                )
+        pending = set()
+        files_iter = iter(files)
+        started = 0
+        done = 0
 
-    return processed, failed
+        def _submit_next() -> bool:
+            nonlocal started
+            try:
+                f = next(files_iter)
+            except StopIteration:
+                return False
+            pending.add(pool.submit(worker, f))
+            started += 1
+            return True
+
+        while len(pending) < max_workers:
+            if cancel_requested is not None and cancel_requested():
+                break
+            if not _submit_next():
+                break
+
+        while pending:
+            done_set, pending = wait(pending, return_when=FIRST_COMPLETED)
+            for fut in done_set:
+                done += 1
+                try:
+                    outcome = fut.result()
+                except Exception:  # pragma: no cover - safety boundary
+                    logger.exception("worker_future_failed", extra={"phase": phase})
+                    outcome = "failed"
+                if outcome == "processed":
+                    processed += 1
+                elif outcome == "failed":
+                    failed += 1
+                else:
+                    cancelled += 1
+                if on_item_done is not None:
+                    on_item_done(outcome == "processed")
+                if done == 1 or done % 100 == 0 or done == len(files):
+                    logger.info(
+                        "processing_progress",
+                        extra={
+                            "phase": phase,
+                            "done": done,
+                            "total": len(files),
+                            "processed": processed,
+                            "failed": failed,
+                            "cancelled": cancelled,
+                        },
+                    )
+
+            while len(pending) < max_workers:
+                if cancel_requested is not None and cancel_requested():
+                    break
+                if not _submit_next():
+                    break
+
+        cancelled += max(0, len(files) - started)
+
+    return processed, failed, cancelled
+
+
+def _copy_file_atomic(
+    src: Path,
+    dest: Path,
+    *,
+    cancel_requested: Callable[[], bool] | None = None,
+) -> bool:
+    tmp_fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{dest.name}.",
+        suffix=".tmp",
+        dir=str(dest.parent),
+    )
+    os.close(tmp_fd)
+    tmp_dest = Path(tmp_name)
+    try:
+        if cancel_requested is not None and cancel_requested():
+            return False
+        shutil.copy2(src, tmp_dest)
+        if cancel_requested is not None and cancel_requested():
+            return False
+        os.replace(tmp_dest, dest)
+        return True
+    finally:
+        try:
+            if tmp_dest.exists():
+                tmp_dest.unlink()
+        except OSError:
+            pass
 
 
 def _safe_relative(path: Path, root: Path) -> Path:
@@ -674,37 +859,58 @@ def _archive_base_name(input_path: Path) -> str:
 
 
 def _tar_gz_dir(
-    root_dir: Path, out_tar_gz: Path, *, progress: ProgressReporter | None = None
+    root_dir: Path,
+    out_tar_gz: Path,
+    *,
+    progress: ProgressReporter | None = None,
+    cancel_requested: Callable[[], bool] | None = None,
 ) -> None:
+    tmp_fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{out_tar_gz.name}.",
+        suffix=".tmp",
+        dir=str(out_tar_gz.parent),
+    )
+    os.close(tmp_fd)
+    tmp_tar_path = Path(tmp_name)
     if out_tar_gz.exists():
         out_tar_gz.unlink()
-    with tarfile.open(out_tar_gz, mode="w:gz") as tf:
-        files = [p for p in root_dir.rglob("*") if p.is_file()]
-        files.sort(key=lambda p: p.relative_to(root_dir).as_posix())
-        total = len(files)
-        if progress is not None:
-            progress.emit(
-                now_event(
-                    kind=ProgressKind.STAGE_PROGRESS,
-                    stage=ProgressStage.ARCHIVE,
-                    current=0,
-                    total=total,
-                    message="collect",
-                )
-            )
-        for i, p in enumerate(files, start=1):
-            # Avoid including the archive itself if user points it inside output_dir.
-            if p.resolve() == out_tar_gz.resolve():
-                continue
-            tf.add(p, arcname=p.relative_to(root_dir).as_posix(), recursive=False)
+    try:
+        with tarfile.open(tmp_tar_path, mode="w:gz") as tf:
+            files = [p for p in root_dir.rglob("*") if p.is_file()]
+            files.sort(key=lambda p: p.relative_to(root_dir).as_posix())
+            total = len(files)
             if progress is not None:
-                if i == 1 or i == total or i % 200 == 0:
-                    progress.emit(
-                        now_event(
-                            kind=ProgressKind.STAGE_PROGRESS,
-                            stage=ProgressStage.ARCHIVE,
-                            current=i,
-                            total=total,
-                            message="writing",
-                        )
+                progress.emit(
+                    now_event(
+                        kind=ProgressKind.STAGE_PROGRESS,
+                        stage=ProgressStage.ARCHIVE,
+                        current=0,
+                        total=total,
+                        message="collect",
                     )
+                )
+            for i, p in enumerate(files, start=1):
+                if cancel_requested is not None and cancel_requested():
+                    raise AnonymizationCancelled("cancelled while writing archive")
+                # Avoid including the archive itself if user points it inside output_dir.
+                if p.resolve() == out_tar_gz.resolve():
+                    continue
+                tf.add(p, arcname=p.relative_to(root_dir).as_posix(), recursive=False)
+                if progress is not None:
+                    if i == 1 or i == total or i % 200 == 0:
+                        progress.emit(
+                            now_event(
+                                kind=ProgressKind.STAGE_PROGRESS,
+                                stage=ProgressStage.ARCHIVE,
+                                current=i,
+                                total=total,
+                                message="writing",
+                            )
+                        )
+        os.replace(tmp_tar_path, out_tar_gz)
+    finally:
+        try:
+            if tmp_tar_path.exists():
+                tmp_tar_path.unlink()
+        except OSError:
+            pass
