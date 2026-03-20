@@ -21,6 +21,7 @@ from log_anonymizer.exclude_filter import ExcludeFilter, default_patterns, load_
 from log_anonymizer.input_handler import handle_input
 from log_anonymizer.profiling.profiler import ProfilingConfig, SensitiveDataProfiler
 from log_anonymizer.rules_loader import Rule, load_rules
+from log_anonymizer.rule_actions import ActionContext
 from log_anonymizer.utils.io import is_text_file
 
 logger = logging.getLogger(__name__)
@@ -48,6 +49,7 @@ class ProcessorConfig:
     suggest_rules_output_path: Path | None = None
     cancellation_token: "CancellationToken | None" = None
     rollback_on_cancel: bool = False
+    anonymization_salt: str | None = None
 
 
 @dataclass(frozen=True)
@@ -130,6 +132,7 @@ def process_with_result(
         ProcessorResult including generated archive file path.
     """
     cfg = config or ProcessorConfig()
+    action_context = ActionContext(salt=cfg.anonymization_salt or "")
     cancelled = False
     rolled_back = False
     all_files: list[Path] = []
@@ -310,6 +313,7 @@ def process_with_result(
                 progress=progress,
                 on_file_done=_on_file_done,
                 cancel_requested=lambda: _is_cancelled(cfg),
+                action_context=action_context,
             )
             cancelled = cancelled or anonymized_cancelled > 0 or _is_cancelled(cfg)
 
@@ -622,6 +626,7 @@ def _process_files_parallel(
     progress: ProgressReporter | None = None,
     on_file_done: Callable[[bool], None] | None = None,
     cancel_requested: Callable[[], bool] | None = None,
+    action_context: ActionContext | None = None,
 ) -> tuple[int, int, int]:
     if not files:
         return 0, 0, 0
@@ -640,6 +645,7 @@ def _process_files_parallel(
                     progress=progress,
                     rel_path=rel.as_posix(),
                     cancel_requested=cancel_requested,
+                    action_context=action_context,
                 )
             except TypeError:
                 # Backward-compat for monkeypatched / older anonymize_file callables.

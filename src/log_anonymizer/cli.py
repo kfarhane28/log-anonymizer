@@ -214,6 +214,7 @@ def main(argv: list[str] | None = None) -> None:
             suggest_rules_output_path=args.suggest_rules_output.resolve()
             if args.suggest_rules_output is not None
             else None,
+            anonymization_salt=cfg.anonymization.salt,
         )
         enable_progress = bool(args.progress) or (
             not bool(args.no_progress) and sys.stderr.isatty()

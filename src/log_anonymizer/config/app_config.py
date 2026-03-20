@@ -13,8 +13,16 @@ class LoggingSettings:
 
 
 @dataclass(frozen=True)
+class AnonymizationSettings:
+    # Optional global salt used by actions like `secure_hash` and `date_shift` when
+    # their per-rule salt is not provided.
+    salt: str = ""
+
+
+@dataclass(frozen=True)
 class AppConfig:
     logging: LoggingSettings = LoggingSettings()
+    anonymization: AnonymizationSettings = AnonymizationSettings()
 
 
 def resolve_config_path(cli_path: Path | None) -> Path | None:
@@ -45,6 +53,8 @@ def load_config(path: Path | None) -> AppConfig:
     - [logging]
       - level: INFO/DEBUG/...
       - format: json|text
+    - [anonymization]
+      - salt: optional stable secret used by some actions
     """
     if path is None:
         return AppConfig()
@@ -57,5 +67,8 @@ def load_config(path: Path | None) -> AppConfig:
     level = parser.get("logging", "level", fallback="INFO").strip() or "INFO"
     fmt = parser.get("logging", "format", fallback="json").strip() or "json"
 
-    return AppConfig(logging=LoggingSettings(level=level, fmt=fmt))
-
+    salt = parser.get("anonymization", "salt", fallback="").strip()
+    return AppConfig(
+        logging=LoggingSettings(level=level, fmt=fmt),
+        anonymization=AnonymizationSettings(salt=salt),
+    )

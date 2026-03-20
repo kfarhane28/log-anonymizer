@@ -1,18 +1,12 @@
 {
-  "version": 2,
+  "version": 1,
   "rules": [
     {
-      "description": "Email address (secure hash)",
+      "description": "Email address",
       "trigger": "@",
       "search": "\\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}\\b",
-      "caseSensitive": "true",
-      "action": {
-        "type": "secure_hash",
-        "algorithm": "sha256",
-        "length": 16,
-        "prefix": "[EMAIL:",
-        "suffix": "]"
-      }
+      "replace": "[EMAIL]",
+      "caseSensitive": "true"
     },
     {
       "description": "HDFS /user/<name>/ path",
@@ -20,17 +14,6 @@
       "search": "(?i)(/user/)([A-Za-z0-9._-]+)(/)",
       "replace": "\\1[USER]\\3",
       "caseSensitive": "false"
-    },
-    {
-      "description": "Account number (mask keep last 4)",
-      "trigger": "acct=",
-      "search": "(?<=\\bacct=)\\d{12,16}\\b",
-      "caseSensitive": "true",
-      "action": {
-        "type": "mask",
-        "maskChar": "*",
-        "keepLast": 4
-      }
     },
     {
       "description": "Absolute file path",
@@ -80,23 +63,6 @@
       "search": "(?i)\\bBearer\\s+\\S+\\b",
       "replace": "Bearer [REDACTED]",
       "caseSensitive": "false"
-    },
-    {
-      "description": "Bucket age (age=23 -> age=18-29)",
-      "trigger": "age=",
-      "search": "\\bage=(\\d+)\\b",
-      "caseSensitive": "true",
-      "action": {
-        "type": "bucket",
-        "group": 1,
-        "fallbackLabel": "other",
-        "buckets": [
-          { "min": 0, "max": 17, "label": "0-17" },
-          { "min": 18, "max": 29, "label": "18-29" },
-          { "min": 30, "max": 49, "label": "30-49" },
-          { "min": 50, "max": 200, "label": "50+" }
-        ]
-      }
     }
   ]
 }

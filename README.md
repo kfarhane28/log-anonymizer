@@ -296,6 +296,8 @@ format = json
 
 User rules are applied in addition to built-in rules. File format:
 
+### Legacy format (v1)
+
 ```json
 {
   "version": 1,
@@ -315,6 +317,133 @@ Notes:
 - `trigger` is an optional fast substring pre-check (rule runs only if the trigger is present in the line). If omitted/empty, the rule runs on every line.
 - `search` is a Python regex, `replace` is passed to `re.sub`.
 - `caseSensitive` defaults to `true` if omitted.
+
+### Action format (v2)
+
+Rules v2 keep the same top-level shape, but use an `action` object instead of `replace`.
+
+```json
+{
+  "version": 2,
+  "rules": [
+    {
+      "description": "Mask account number",
+      "trigger": "acct=",
+      "search": "(?<=\\bacct=)\\d{12,16}\\b",
+      "caseSensitive": "true",
+      "action": { "type": "mask", "maskChar": "*", "keepLast": 4 }
+    }
+  ]
+}
+```
+
+Supported `action.type` values:
+
+- `replacement`: fixed replacement (same as legacy `replace`)
+  - fields: `value` (string)
+- `redaction`: remove the match entirely
+  - fields: none
+- `mask`: mask fully/partially with a character
+  - fields: `maskChar` (1 char, default `*`), `keepLast` (int), `keepFirst` (int)
+- `secure_hash`: deterministic SHA-256 hash replacement
+  - fields: `algorithm` (`sha256`), `salt` (optional), `length` (8–64), `prefix`, `suffix`
+- `date_shift`: shift parsed dates by a deterministic number of days
+  - fields: `formats` (array of `strptime` formats), `maxShiftDays` (0+), `salt` (optional), `group` (optional capture group)
+- `bucket`: map numeric values into configured ranges
+  - fields: `buckets` (array of `{min,max,label}`), `group` (optional capture group), `fallbackLabel`
+
+Notes:
+- A `version: 2` rules file may mix legacy rules (`replace`) and action rules (`action`) in the same `rules` array.
+- Some actions support `group` to replace only a capturing group while keeping the rest of the match unchanged (useful for `age=23`).
+
+Examples:
+
+```json
+{
+  "description": "Fixed replacement (v2)",
+  "trigger": "uuid=",
+  "search": "\\buuid=[0-9a-fA-F-]{36}\\b",
+  "action": { "type": "replacement", "value": "uuid=[UUID]" }
+}
+```
+
+```json
+{
+  "description": "Hash email",
+  "trigger": "@",
+  "search": "\\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}\\b",
+  "action": { "type": "secure_hash", "algorithm": "sha256", "length": 16 }
+}
+```
+
+```json
+{
+  "description": "Redact secret",
+  "trigger": "secret=",
+  "search": "secret=[^\\s]+",
+  "action": { "type": "redaction" }
+}
+```
+
+```json
+{
+  "description": "Mask full (PIN)",
+  "trigger": "pin=",
+  "search": "(?<=\\bpin=)\\d{4}\\b",
+  "action": { "type": "mask", "maskChar": "*" }
+}
+```
+
+```json
+{
+  "description": "Mask keep last 4 (account)",
+  "trigger": "acct=",
+  "search": "(?<=\\bacct=)\\d{12,16}\\b",
+  "action": { "type": "mask", "maskChar": "*", "keepLast": 4 }
+}
+```
+
+```json
+{
+  "description": "Bucket age",
+  "trigger": "age=",
+  "search": "\\bage=(\\d+)\\b",
+  "action": {
+    "type": "bucket",
+    "group": 1,
+    "fallbackLabel": "other",
+    "buckets": [
+      { "min": 0, "max": 17, "label": "0-17" },
+      { "min": 18, "max": 29, "label": "18-29" },
+      { "min": 30, "max": 49, "label": "30-49" },
+      { "min": 50, "max": 200, "label": "50+" }
+    ]
+  }
+}
+```
+
+```json
+{
+  "description": "Date shift (ISO date in key/value)",
+  "trigger": "date=",
+  "search": "\\bdate=(\\d{4}-\\d{2}-\\d{2})\\b",
+  "action": {
+    "type": "date_shift",
+    "group": 1,
+    "formats": ["%Y-%m-%d"],
+    "maxShiftDays": 30
+  }
+}
+```
+
+Salt for deterministic actions:
+- `secure_hash` and `date_shift` are deterministic for a given salt.
+- You can set a per-rule salt (`action.salt`) or a global salt in `log-anonymizer.ini`:
+
+```ini
+[anonymization]
+salt = your-stable-secret-salt
+```
 
 ## `.exclude` format
 

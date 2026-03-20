@@ -58,6 +58,6 @@ def test_load_rules_valid_and_invalid_regex(tmp_path: Path, caplog: pytest.LogCa
 
 def test_load_rules_rejects_wrong_version(tmp_path: Path) -> None:
     p = tmp_path / "rules.json"
-    p.write_text(json.dumps({"version": 2, "rules": []}), encoding="utf-8")
+    p.write_text(json.dumps({"version": 3, "rules": []}), encoding="utf-8")
     with pytest.raises(ValueError):
         load_rules(p)

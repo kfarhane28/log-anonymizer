@@ -29,6 +29,7 @@ from log_anonymizer.profiling.runner import run_sensitive_data_profiling
 from log_anonymizer.processor import CancellationToken, ProcessorConfig, process_with_result
 from log_anonymizer.progress import ProgressEvent, ProgressKind, ProgressStage, QueueProgressReporter
 from log_anonymizer.rules_loader import load_rules
+from log_anonymizer.rules_validation import validate_rules_json_bytes
 
 
 InputMode = Literal["Upload file", "Upload archive", "Use path"]
@@ -260,7 +261,13 @@ def _init_state() -> None:
     st.session_state.setdefault("log_prev_handlers", None)
     st.session_state.setdefault("ui_warnings", [])
     st.session_state.setdefault("ui_errors", [])
-    st.session_state.setdefault("rules_editor_df", None)
+    st.session_state.setdefault("rules_editor_df_v1", None)
+    st.session_state.setdefault("rules_editor_df_v2", None)
+    st.session_state.setdefault("rules_editor_mode", "table_v1")  # table_v1, table_v2, json
+    # Radio widget state for editor mode (Table v1 / Table v2 / JSON).
+    st.session_state.setdefault("rules_editor_mode_radio", None)
+    st.session_state.setdefault("rules_editor_text", None)  # derived JSON content (from tables or last JSON edit)
+    st.session_state.setdefault("rules_editor_json_widget", None)  # Streamlit widget state for JSON editor
     st.session_state.setdefault("exclude_editor_df", None)
     st.session_state.setdefault("rules_upload_sig", None)
     st.session_state.setdefault("exclude_upload_sig", None)
@@ -1094,11 +1101,123 @@ def _write_default_rules_file(tmp_dir: Path) -> Path:
 
 
 def _ensure_rules_editor_initialized() -> None:
-    if st.session_state.get("rules_editor_df") is not None:
+    if st.session_state.get("rules_editor_df_v1") is None:
+        st.session_state["rules_editor_df_v1"] = pd.DataFrame(
+            columns=["description", "trigger", "search", "replace", "caseSensitive"]
+        )
+    if st.session_state.get("rules_editor_df_v2") is None:
+        st.session_state["rules_editor_df_v2"] = pd.DataFrame(
+            columns=["description", "trigger", "search", "action", "caseSensitive"]
+        )
+    if st.session_state.get("rules_editor_mode") not in ("table_v1", "table_v2", "json"):
+        st.session_state["rules_editor_mode"] = "table_v1"
+    # Initialize the radio label only when missing/invalid; do not force it on every rerun.
+    if st.session_state.get("rules_editor_mode_radio") not in ("Table (v1)", "Table (v2)", "JSON (v1/v2)"):
+        st.session_state["rules_editor_mode_radio"] = _label_for_rules_editor_mode(st.session_state["rules_editor_mode"])
+    if st.session_state.get("rules_editor_text") is None:
+        raw = _rules_dfs_to_json_bytes(
+            st.session_state["rules_editor_df_v1"],
+            st.session_state["rules_editor_df_v2"],
+        )
+        st.session_state["rules_editor_text"] = raw.decode("utf-8")
+    if st.session_state.get("rules_editor_json_widget") is None:
+        # Only set an initial value for the JSON widget; avoid modifying it after instantiation.
+        st.session_state["rules_editor_json_widget"] = st.session_state["rules_editor_text"]
+
+
+def _label_for_rules_editor_mode(mode: str) -> str:
+    if mode == "table_v2":
+        return "Table (v2)"
+    if mode == "json":
+        return "JSON (v1/v2)"
+    return "Table (v1)"
+
+
+def _mode_for_rules_editor_label(label: str) -> str:
+    if label == "Table (v2)":
+        return "table_v2"
+    if label == "JSON (v1/v2)":
+        return "json"
+    return "table_v1"
+
+
+def _sync_rules_editor_json_from_tables() -> None:
+    raw = _rules_dfs_to_json_bytes(
+        st.session_state["rules_editor_df_v1"],
+        st.session_state["rules_editor_df_v2"],
+    )
+    text = raw.decode("utf-8")
+    st.session_state["rules_editor_text"] = text
+    # Do not update the JSON widget value here; Streamlit forbids updating a widget's
+    # session_state key after instantiation. Use the mode-change callback instead.
+
+
+def _on_add_rule_clicked() -> None:
+    _ensure_rules_editor_initialized()
+    label = st.session_state.get("rules_editor_mode_radio") or _label_for_rules_editor_mode(
+        st.session_state.get("rules_editor_mode", "table_v1")
+    )
+    mode = _mode_for_rules_editor_label(str(label))
+    if mode == "json":
         return
-    st.session_state["rules_editor_df"] = pd.DataFrame(
+
+    if mode == "table_v2":
+        df = st.session_state["rules_editor_df_v2"]
+        df = pd.concat(
+            [
+                df,
+                pd.DataFrame(
+                    [
+                        {
+                            "description": "",
+                            "trigger": "",
+                            "search": "",
+                            "action": '{"type":"redaction"}',
+                            "caseSensitive": "",
+                        }
+                    ]
+                ),
+            ],
+            ignore_index=True,
+        )
+        st.session_state["rules_editor_df_v2"] = df
+    else:
+        df = st.session_state["rules_editor_df_v1"]
+        df = pd.concat(
+            [
+                df,
+                pd.DataFrame(
+                    [
+                        {
+                            "description": "",
+                            "trigger": "",
+                            "search": "",
+                            "replace": "",
+                            "caseSensitive": "",
+                        }
+                    ]
+                ),
+            ],
+            ignore_index=True,
+        )
+        st.session_state["rules_editor_df_v1"] = df
+
+    _sync_rules_editor_json_from_tables()
+
+
+def _on_reset_rules_clicked() -> None:
+    _ensure_rules_editor_initialized()
+    st.session_state["rules_editor_df_v1"] = pd.DataFrame(
         columns=["description", "trigger", "search", "replace", "caseSensitive"]
     )
+    st.session_state["rules_editor_df_v2"] = pd.DataFrame(
+        columns=["description", "trigger", "search", "action", "caseSensitive"]
+    )
+    st.session_state["rules_editor_mode"] = "table_v1"
+    st.session_state["rules_editor_mode_radio"] = "Table (v1)"
+    _sync_rules_editor_json_from_tables()
+    # Allow re-uploading the same file after a reset.
+    st.session_state["rules_upload_sig"] = None
 
 
 def _ensure_exclude_editor_initialized() -> None:
@@ -1141,10 +1260,72 @@ def _rules_df_to_json_bytes(df: "pd.DataFrame") -> bytes:
     return (json.dumps(payload, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
 
 
+def _rules_dfs_to_json_bytes(df_v1: "pd.DataFrame", df_v2: "pd.DataFrame") -> bytes:
+    rules: list[dict[str, Any]] = []
+
+    # v1 (legacy) table: search + replace.
+    for _, row in df_v1.iterrows():
+        description = str(row.get("description") or "").strip()
+        trigger = str(row.get("trigger") or "").strip()
+        search = str(row.get("search") or "").strip()
+        replace = str(row.get("replace") or "")
+        case_sensitive = row.get("caseSensitive")
+
+        if not trigger and not search and replace == "" and not description:
+            continue
+        rule: dict[str, Any] = {"description": description, "trigger": trigger, "search": search, "replace": replace}
+        if case_sensitive is not None and str(case_sensitive).strip() != "":
+            rule["caseSensitive"] = case_sensitive
+        rules.append(rule)
+
+    # v2 (action) table: search + action object.
+    for _, row in df_v2.iterrows():
+        description = str(row.get("description") or "").strip()
+        trigger = str(row.get("trigger") or "").strip()
+        search = str(row.get("search") or "").strip()
+        action_text = str(row.get("action") or "").strip()
+        case_sensitive = row.get("caseSensitive")
+
+        if not trigger and not search and not action_text and not description:
+            continue
+
+        action_obj: Any
+        if not action_text:
+            # Let the validator surface a clear error for missing action.
+            action_obj = None
+        else:
+            try:
+                action_obj = json.loads(action_text)
+            except Exception:
+                # Keep raw string so validator can fail clearly (invalid JSON).
+                action_obj = action_text
+
+        rule = {"description": description, "trigger": trigger, "search": search, "action": action_obj}
+        if case_sensitive is not None and str(case_sensitive).strip() != "":
+            rule["caseSensitive"] = case_sensitive
+        rules.append(rule)
+
+    version = 2 if any(isinstance(r, dict) and r.get("action") is not None for r in rules) else 1
+    payload = {"version": version, "rules": rules}
+    return (json.dumps(payload, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+
+
 def _write_rules_from_editor(tmp_dir: Path) -> Path:
     _ensure_rules_editor_initialized()
-    df = st.session_state["rules_editor_df"]
-    raw = _rules_df_to_json_bytes(df)
+    mode = st.session_state.get("rules_editor_mode", "table")
+    if mode == "json":
+        # Prefer the JSON editor widget content when present.
+        text = str(
+            st.session_state.get("rules_editor_json_widget")
+            or st.session_state.get("rules_editor_text")
+            or ""
+        )
+        raw = text.encode("utf-8")
+    else:
+        raw = _rules_dfs_to_json_bytes(
+            st.session_state["rules_editor_df_v1"],
+            st.session_state["rules_editor_df_v2"],
+        )
     err = _validate_rules_json_bytes(raw)
     if err:
         st.session_state["ui_errors"].append(f"Rules editor invalid: {err}")
@@ -1193,7 +1374,19 @@ def _write_exclude_from_editor(tmp_dir: Path) -> Path | None:
 def _maybe_load_rules_upload_into_editor(raw: bytes, *, name: str) -> None:
     sig = _sig(name, raw)
     if st.session_state.get("rules_upload_sig") == sig:
-        return
+        # If the same file is uploaded again but the editor state was reset/migrated,
+        # re-apply it so the UI updates correctly.
+        df_v1 = st.session_state.get("rules_editor_df_v1")
+        df_v2 = st.session_state.get("rules_editor_df_v2")
+        text = st.session_state.get("rules_editor_text")
+        if (
+            isinstance(df_v1, pd.DataFrame)
+            and isinstance(df_v2, pd.DataFrame)
+            and (not df_v1.empty or not df_v2.empty)
+            and isinstance(text, str)
+            and text.strip()
+        ):
+            return
     st.session_state["rules_upload_sig"] = sig
 
     try:
@@ -1204,21 +1397,58 @@ def _maybe_load_rules_upload_into_editor(raw: bytes, *, name: str) -> None:
     if not isinstance(rules, list):
         return
 
-    rows: list[dict[str, Any]] = []
+    version_raw = obj.get("version", 1) if isinstance(obj, dict) else 1
+    try:
+        version = int(version_raw)
+    except Exception:
+        version = 1
+
+    rows_v1: list[dict[str, Any]] = []
+    rows_v2: list[dict[str, Any]] = []
     for r in rules:
         if not isinstance(r, dict):
             continue
-        rows.append(
-            {
-                "description": r.get("description", ""),
-                "trigger": r.get("trigger", ""),
-                "search": r.get("search", ""),
-                "replace": r.get("replace", ""),
-                "caseSensitive": r.get("caseSensitive", ""),
-            }
-        )
-    st.session_state["rules_editor_df"] = pd.DataFrame(
-        rows, columns=["description", "trigger", "search", "replace", "caseSensitive"]
+        if r.get("action") is not None:
+            rows_v2.append(
+                {
+                    "description": r.get("description", ""),
+                    "trigger": r.get("trigger", ""),
+                    "search": r.get("search", ""),
+                    "action": json.dumps(r.get("action"), ensure_ascii=False),
+                    "caseSensitive": r.get("caseSensitive", ""),
+                }
+            )
+        else:
+            rows_v1.append(
+                {
+                    "description": r.get("description", ""),
+                    "trigger": r.get("trigger", ""),
+                    "search": r.get("search", ""),
+                    "replace": r.get("replace", ""),
+                    "caseSensitive": r.get("caseSensitive", ""),
+                }
+            )
+
+    st.session_state["rules_editor_df_v1"] = pd.DataFrame(
+        rows_v1, columns=["description", "trigger", "search", "replace", "caseSensitive"]
+    )
+    st.session_state["rules_editor_df_v2"] = pd.DataFrame(
+        rows_v2, columns=["description", "trigger", "search", "action", "caseSensitive"]
+    )
+    try:
+        st.session_state["rules_editor_text"] = json.dumps(obj, ensure_ascii=False, indent=2) + "\n"
+    except Exception:
+        st.session_state["rules_editor_text"] = raw.decode("utf-8", errors="replace")
+    # Seed the JSON widget with the uploaded content (safe here: before widget instantiation in rerun).
+    st.session_state["rules_editor_json_widget"] = st.session_state["rules_editor_text"]
+
+    # Default editor selection: prefer table views; use v2 table when the file is v2 or contains actions.
+    if version == 2 or rows_v2:
+        st.session_state["rules_editor_mode"] = "table_v2" if rows_v2 else "table_v1"
+    else:
+        st.session_state["rules_editor_mode"] = "table_v1"
+    st.session_state["rules_editor_mode_radio"] = _label_for_rules_editor_mode(
+        st.session_state["rules_editor_mode"]
     )
 
 
@@ -1245,50 +1475,95 @@ def _render_rules_editor() -> None:
     _ensure_rules_editor_initialized()
     st.caption("Edit rules that will be applied in addition to built-in rules.")
 
-    b1, b2, _ = st.columns([1.2, 1.2, 6])
-    if b1.button("Add rule", key="add_rule"):
-        df = st.session_state["rules_editor_df"]
-        df = pd.concat(
-            [
-                df,
-                pd.DataFrame(
-                    [
-                        {
-                            "description": "",
-                            "trigger": "",
-                            "search": "",
-                            "replace": "",
-                            "caseSensitive": "",
-                        }
-                    ]
-                ),
-            ],
-            ignore_index=True,
-        )
-        st.session_state["rules_editor_df"] = df
-        st.rerun()
-    if b2.button("Reset rules", key="reset_rules"):
-        st.session_state["rules_editor_df"] = pd.DataFrame(
-            columns=["description", "trigger", "search", "replace", "caseSensitive"]
-        )
-        st.rerun()
+    # Keep the widget's state in a dedicated key to avoid "double click" behavior on reruns.
+    # IMPORTANT: do not overwrite the widget key on every rerun, otherwise the radio becomes "stuck".
+    options = ["Table (v1)", "Table (v2)", "JSON (v1/v2)"]
+    current_label = _label_for_rules_editor_mode(st.session_state.get("rules_editor_mode", "table_v1"))
+    if st.session_state.get("rules_editor_mode_radio") not in options:
+        st.session_state["rules_editor_mode_radio"] = current_label
 
-    edited = st.data_editor(
-        st.session_state["rules_editor_df"],
-        key="rules_editor",
-        num_rows="dynamic",
-        width="stretch",
-        column_config={
-            "description": st.column_config.TextColumn("description"),
-            "trigger": st.column_config.TextColumn("trigger"),
-            "search": st.column_config.TextColumn("search (regex)"),
-            "replace": st.column_config.TextColumn("replace"),
-            "caseSensitive": st.column_config.TextColumn("caseSensitive"),
-        },
+    def _on_rules_editor_mode_changed() -> None:
+        label = st.session_state.get("rules_editor_mode_radio") or "Table (v1)"
+        st.session_state["rules_editor_mode"] = _mode_for_rules_editor_label(str(label))
+        if st.session_state["rules_editor_mode"] == "json":
+            # When switching into JSON mode, refresh the JSON editor with the derived JSON
+            # from current tables/upload state.
+            st.session_state["rules_editor_json_widget"] = str(st.session_state.get("rules_editor_text") or "")
+
+    mode_label = st.radio(
+        "Editor mode",
+        options=options,
+        key="rules_editor_mode_radio",
+        horizontal=True,
+        on_change=_on_rules_editor_mode_changed,
     )
-    st.session_state["rules_editor_df"] = edited
+    # Ensure mode follows the widget value (the callback handles mode changes, but keep this safe).
+    st.session_state["rules_editor_mode"] = _mode_for_rules_editor_label(mode_label)
 
-    raw = _rules_df_to_json_bytes(edited)
+    b1, b2, _ = st.columns([1.2, 1.2, 6])
+    b1.button(
+        "Add rule",
+        key="add_rule",
+        disabled=st.session_state["rules_editor_mode"] == "json",
+        on_click=_on_add_rule_clicked,
+    )
+    b2.button(
+        "Reset rules",
+        key="reset_rules",
+        on_click=_on_reset_rules_clicked,
+    )
+
+    if st.session_state["rules_editor_mode"] == "table_v1":
+        edited = st.data_editor(
+            st.session_state["rules_editor_df_v1"],
+            key="rules_editor_v1",
+            num_rows="dynamic",
+            width="stretch",
+            column_config={
+                "description": st.column_config.TextColumn("description"),
+                "trigger": st.column_config.TextColumn("trigger"),
+                "search": st.column_config.TextColumn("search (regex)"),
+                "replace": st.column_config.TextColumn("replace"),
+                "caseSensitive": st.column_config.TextColumn("caseSensitive"),
+            },
+        )
+        st.session_state["rules_editor_df_v1"] = edited
+        raw = _rules_dfs_to_json_bytes(edited, st.session_state["rules_editor_df_v2"])
+        st.session_state["rules_editor_text"] = raw.decode("utf-8")
+    elif st.session_state["rules_editor_mode"] == "table_v2":
+        edited = st.data_editor(
+            st.session_state["rules_editor_df_v2"],
+            key="rules_editor_v2",
+            num_rows="dynamic",
+            width="stretch",
+            column_config={
+                "description": st.column_config.TextColumn("description"),
+                "trigger": st.column_config.TextColumn("trigger"),
+                "search": st.column_config.TextColumn("search (regex)"),
+                "action": st.column_config.TextColumn("action (JSON)"),
+                "caseSensitive": st.column_config.TextColumn("caseSensitive"),
+            },
+        )
+        st.session_state["rules_editor_df_v2"] = edited
+        raw = _rules_dfs_to_json_bytes(st.session_state["rules_editor_df_v1"], edited)
+        st.session_state["rules_editor_text"] = raw.decode("utf-8")
+    else:
+        def _on_rules_json_changed() -> None:
+            st.session_state["rules_editor_text"] = str(st.session_state.get("rules_editor_json_widget") or "")
+
+        # Ensure the JSON widget has some initial content before it is instantiated.
+        if st.session_state.get("rules_editor_json_widget") is None:
+            st.session_state["rules_editor_json_widget"] = str(st.session_state.get("rules_editor_text") or "")
+        st.text_area(
+            "rules.json",
+            key="rules_editor_json_widget",
+            height=320,
+            on_change=_on_rules_json_changed,
+        )
+        text = str(st.session_state.get("rules_editor_json_widget") or "")
+        st.session_state["rules_editor_text"] = text
+        raw = text.encode("utf-8")
+
     err = _validate_rules_json_bytes(raw)
     if err:
         st.error(f"Rules validation error: {err}")
@@ -1346,43 +1621,7 @@ def _looks_like_json(raw: bytes) -> bool:
 
 
 def _validate_rules_json_bytes(raw: bytes) -> str | None:
-    """
-    Validate that uploaded rules.json is parseable and follows the expected schema.
-    """
-    try:
-        obj = json.loads(raw.decode("utf-8"))
-    except UnicodeDecodeError:
-        return "not valid UTF-8"
-    except json.JSONDecodeError as exc:
-        return f"invalid JSON: {exc}"
-
-    if not isinstance(obj, dict):
-        return "root must be a JSON object"
-    if obj.get("version") != 1:
-        return "version must be 1"
-    rules = obj.get("rules")
-    if not isinstance(rules, list):
-        return "rules must be a list"
-
-    for i, r in enumerate(rules):
-        if not isinstance(r, dict):
-            return f"rules[{i}] must be an object"
-        for key in ("search", "replace"):
-            if key not in r:
-                return f"rules[{i}] missing '{key}'"
-            if not isinstance(r[key], str):
-                return f"rules[{i}].{key} must be a string"
-        if not r["search"].strip():
-            return f"rules[{i}].search must be a non-empty string"
-        if "trigger" in r and r["trigger"] is not None and not isinstance(r["trigger"], str):
-            return f"rules[{i}].trigger must be a string"
-        if "description" in r and r["description"] is not None and not isinstance(r["description"], str):
-            return f"rules[{i}].description must be a string"
-        if "caseSensitive" in r and r["caseSensitive"] is not None and not isinstance(
-            r["caseSensitive"], (str, bool, int, float)
-        ):
-            return f"rules[{i}].caseSensitive must be boolean or string"
-    return None
+    return validate_rules_json_bytes(raw)
 
 
 def _validate_exclude_bytes(raw: bytes, *, filename: str) -> str | None:

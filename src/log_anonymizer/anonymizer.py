@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Callable, Iterable, Iterator, TextIO
 
 from log_anonymizer.rules_loader import Rule
+from log_anonymizer.rule_actions import ActionContext
 from log_anonymizer.utils.io import is_text_file
 
 logger = logging.getLogger(__name__)
@@ -51,7 +52,9 @@ class AnonymizationCancelled(Exception):
     """Raised when anonymization is cancelled before output is committed."""
 
 
-def anonymize_text_block(text: str, rules: Iterable[Rule]) -> tuple[str, AnonymizeTextStats]:
+def anonymize_text_block(
+    text: str, rules: Iterable[Rule], *, action_context: ActionContext | None = None
+) -> tuple[str, AnonymizeTextStats]:
     """
     Anonymize a block of text line-by-line using the provided rules.
 
@@ -60,14 +63,17 @@ def anonymize_text_block(text: str, rules: Iterable[Rule]) -> tuple[str, Anonymi
     """
     # Preserve newline chars so the output shape matches the input.
     lines = text.splitlines(keepends=True)
-    out_lines, stats = _anonymize_lines(lines, rules)
+    out_lines, stats = _anonymize_lines(lines, rules, action_context=action_context)
     return "".join(out_lines), stats
 
 
-def _anonymize_lines(lines: Iterable[str], rules: Iterable[Rule]) -> tuple[list[str], AnonymizeTextStats]:
+def _anonymize_lines(
+    lines: Iterable[str], rules: Iterable[Rule], *, action_context: ActionContext | None
+) -> tuple[list[str], AnonymizeTextStats]:
     rules_list = list(rules)
+    ctx = action_context or ActionContext()
     acc = _AnonymizationAccumulator(triggered=set(), replacements_by_rule={}, total_replacements=0)
-    out_lines = list(_iter_anonymized_lines(lines, rules_list, acc))
+    out_lines = list(_iter_anonymized_lines(lines, rules_list, acc, ctx))
     stats = AnonymizeTextStats(
         total_replacements=acc.total_replacements,
         triggered_rules=tuple(sorted(acc.triggered)),
@@ -77,7 +83,7 @@ def _anonymize_lines(lines: Iterable[str], rules: Iterable[Rule]) -> tuple[list[
 
 
 def _iter_anonymized_lines(
-    lines: Iterable[str], rules_list: list[Rule], acc: _AnonymizationAccumulator
+    lines: Iterable[str], rules_list: list[Rule], acc: _AnonymizationAccumulator, ctx: ActionContext
 ) -> Iterator[str]:
     for line in lines:
         new_line = line
@@ -86,7 +92,11 @@ def _iter_anonymized_lines(
                 continue
             key = rule.description or rule.trigger or rule.regex.pattern
             acc.triggered.add(key)
-            new_line, n = rule.regex.subn(rule.replacement, new_line)
+            action = rule.action
+            if action is None:  # pragma: no cover
+                raise RuntimeError(f"Rule action missing for {key!r}")
+            repl = action.as_replacement(context=ctx, rule_key=key)
+            new_line, n = rule.regex.subn(repl, new_line)
             if n:
                 acc.replacements_by_rule[key] = acc.replacements_by_rule.get(key, 0) + n
                 acc.total_replacements += n
@@ -103,6 +113,7 @@ def anonymize_file(
     progress_min_bytes: int = 5 * 1024 * 1024,
     progress_min_interval_s: float = 0.2,
     cancel_requested: Callable[[], bool] | None = None,
+    action_context: ActionContext | None = None,
 ) -> AnonymizeFileStats:
     """
     Anonymize a log file line-by-line using the provided rules.
@@ -121,6 +132,7 @@ def anonymize_file(
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     rules_list = list(rules)
+    ctx = action_context or ActionContext()
     acc = _AnonymizationAccumulator(triggered=set(), replacements_by_rule={}, total_replacements=0)
 
     size_bytes: int | None = None
@@ -156,7 +168,7 @@ def anonymize_file(
             "w", encoding="utf-8", errors="replace", newline=""
         ) as fout:
             last_emit = 0.0
-            for new_line in _iter_anonymized_lines(fin, rules_list, acc):
+            for new_line in _iter_anonymized_lines(fin, rules_list, acc, ctx):
                 if cancel_requested is not None and cancel_requested():
                     raise AnonymizationCancelled(f"cancelled while processing {in_path}")
                 fout.write(new_line)
