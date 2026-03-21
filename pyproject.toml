@@ -8,11 +8,11 @@ version = "0.1.0"
 description = "CLI tool to anonymize Hadoop/Cloudera logs (HDFS, YARN, Hive, Spark, Impala, etc.)"
 readme = "README.md"
 requires-python = ">=3.10"
-license = { file = "LICENSE" }
-authors = [{ name = "Squad Data" }]
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "Your Name", email = "you@example.com" }]
 keywords = ["anonymization", "logs", "hadoop", "cloudera", "security", "redaction"]
 classifiers = [
-  "License :: OSI Approved :: Apache Software License",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3 :: Only",
   "Programming Language :: Python :: 3.10",
@@ -27,9 +27,24 @@ Repository = "https://github.com/kfarhane28/log-anonymizer"
 
 [project.scripts]
 log-anonymizer = "log_anonymizer.__main__:main"
+log-anonymizer-ui = "log_anonymizer.ui:main"
+
+[project.optional-dependencies]
+# UI dependencies are optional so the core CLI stays dependency-free.
+ui = [
+  "streamlit>=1.30.0",
+  "pandas>=2.0.0",
+]
+dev = [
+  "build>=1.2.0",
+  "pytest>=8.0.0",
+]
 
 [tool.setuptools]
 package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+log_anonymizer = ["assets/*.svg"]

@@ -12,6 +12,7 @@ from log_anonymizer.config.app_config import load_config, resolve_config_path
 from log_anonymizer.config.logging_config import LogFormat, setup_logging
 from log_anonymizer.exclude_filter import ExcludeFilter, default_patterns, load_patterns
 from log_anonymizer.input_handler import handle_input
+from log_anonymizer import __version__
 from log_anonymizer.profiling.runner import run_sensitive_data_profiling
 from log_anonymizer.processor import ProcessorConfig, process
 from log_anonymizer.progress import ProgressEvent, ProgressStopToken, QueueProgressReporter
@@ -24,6 +25,7 @@ def _build_parser() -> argparse.ArgumentParser:
         prog="log-anonymizer",
         description="Anonymize Hadoop/Cloudera logs (directory, file, or archive). Writes a single .tar.gz archive into the output directory.",
     )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument(
         "--input",
         "-i",

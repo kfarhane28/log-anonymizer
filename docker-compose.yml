@@ -1,0 +1,13 @@
+services:
+  ui:
+    build:
+      context: .
+      args:
+        WITH_UI: "1"
+    image: log-anonymizer:local
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./tmp_test:/data
+    command: ["log-anonymizer-ui"]
+
