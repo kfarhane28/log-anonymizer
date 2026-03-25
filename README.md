@@ -29,9 +29,141 @@ The project ships with a minimal set of built-in rules (IPs, Kerberos principals
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
-pip install -e .
+
+# Core (CLI only)
+pip install .
+
+# With UI dependencies (Streamlit + pandas)
+pip install ".[ui]"
 ```
+
+## Run (CLI)
+
+```bash
+log-anonymizer --version
+log-anonymizer --help
+```
+
+Example anonymization run:
+
+```bash
+log-anonymizer --input tmp_test/in --output tmp_test/out
+```
+
+## Run (UI)
+
+The UI requires the optional dependencies:
+
+```bash
+pip install ".[ui]"
+log-anonymizer-ui
+```
+
+Then open `http://localhost:8501`.
+
+## Build (wheel + sdist)
+
+```bash
+python -m pip install -U build
+python -m build --no-isolation
+```
+
+Artifacts are written to `dist/` (`.whl` and `.tar.gz`).
+
+You can also run `make build` if you prefer.
+
+## Distribution & release
+
+- Changelog: `CHANGELOG.md`
+- Release process: `docs/RELEASE.md` (includes PyPI + Docker publishing)
+- Local release build + smoke tests: `make release-build`
+
+## Install from wheel
+
+See `docs/INSTALL_WHEEL.md` (end users) and `docs/RELEASE.md` (admins).
+
+## Docker
+
+End-user/admin guide: `docs/INSTALL_DOCKER.md`.
+
+### Build the image
+
+Build a single image that can run both the CLI and the Streamlit UI:
+
+```bash
+docker build -t log-anonymizer:local .
+```
+
+Build a smaller CLI-only image (no Streamlit/pandas):
+
+```bash
+docker build --build-arg WITH_UI=0 -t log-anonymizer:cli .
+```
+
+### Run the CLI (with mounted input/output)
+
+```bash
+docker run --rm \
+  -v "$PWD/tmp_test/in:/input:ro" \
+  -v "$PWD/tmp_test/out:/output" \
+  log-anonymizer:local \
+  log-anonymizer --input /input --output /output
+```
+
+With additional files:
+
+```bash
+docker run --rm \
+  -v "$PWD/tmp_test/in:/input:ro" \
+  -v "$PWD/tmp_test/out:/output" \
+  -v "$PWD/rules.json:/config/rules.json:ro" \
+  -v "$PWD/.exclude:/config/.exclude:ro" \
+  log-anonymizer:local \
+  log-anonymizer --input /input --output /output --rules /config/rules.json --exclude /config/.exclude
+```
+
+Config file:
+
+```bash
+docker run --rm \
+  -v "$PWD/tmp_test/in:/input:ro" \
+  -v "$PWD/tmp_test/out:/output" \
+  -v "$PWD/log-anonymizer.ini:/config/log-anonymizer.ini:ro" \
+  -e LOG_ANONYMIZER_CONFIG=/config/log-anonymizer.ini \
+  log-anonymizer:local \
+  log-anonymizer --input /input --output /output
+```
+
+Note: the container runs as a non-root user by default. If you hit volume permission issues on Linux, add `--user "$(id -u):$(id -g)"`.
+
+### Run the UI (Streamlit)
+
+```bash
+docker run --rm -p 8501:8501 log-anonymizer:local log-anonymizer-ui
+```
+
+If you want the UI to read/write host files by path, mount a volume (example mounts `tmp_test` to `/data`):
+
+```bash
+docker run --rm -p 8501:8501 \
+  -v "$PWD/tmp_test:/data" \
+  log-anonymizer:local \
+  log-anonymizer-ui
+```
+
+Then open `http://localhost:8501`.
+
+### Docker Compose (UI)
+
+```bash
+docker compose up --build
+```
+
+## Troubleshooting
+
+- `log-anonymizer-ui`: if it says UI deps are missing, install with `pip install "log-anonymizer[ui]"` (or `pip install ".[ui]"` from the repo).
+- Docker volume permissions (Linux): the container runs as non-root; add `--user "$(id -u):$(id -g)"` if output folders are not writable.
+- Build isolation/offline networks: use `python -m build --no-isolation` in an environment where build dependencies are already installed.
 
 ## Quick start (CLI)
 
@@ -46,7 +178,14 @@ Output:
 
 ## Web UI (Streamlit)
 
-Launch the web UI:
+Launch the web UI (installed entry point):
+
+```bash
+source .venv/bin/activate
+log-anonymizer-ui
+```
+
+Alternatively (repo/dev convenience):
 
 ```bash
 source .venv/bin/activate

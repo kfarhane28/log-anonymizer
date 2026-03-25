@@ -1,8 +1,9 @@
 stages:
   - test
+  - build
 
 default:
-  image: python:3.11-slim
+  image: python:3.12-slim
 
 variables:
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
@@ -24,3 +25,34 @@ pytest:
     - python -m pip install -r requirements-dev.txt
     - pytest -q
 
+build_wheel:
+  stage: build
+  script:
+    - python -V
+    - python -m venv .venv
+    - . .venv/bin/activate
+    - python -m pip install --upgrade pip
+    - python -m pip install -U build setuptools wheel
+    - python -m build --no-isolation
+    - bash scripts/smoke_test_wheel.sh
+  artifacts:
+    when: always
+    paths:
+      - dist/
+
+docker_image:
+  stage: build
+  image: docker:27
+  services:
+    - docker:27-dind
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+  rules:
+    - when: manual
+      allow_failure: true
+  script:
+    - docker version
+    - docker build -t log-anonymizer:ci .
+    - docker run --rm log-anonymizer:ci log-anonymizer --help
+    - docker run --rm log-anonymizer:ci log-anonymizer-ui --check

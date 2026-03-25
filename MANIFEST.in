@@ -1,0 +1,6 @@
+include README.md
+include LICENSE
+include log-anonymizer.ini
+recursive-include assets *.svg
+recursive-include src/log_anonymizer/assets *.svg
+recursive-include examples *
