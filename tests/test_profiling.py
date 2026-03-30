@@ -35,9 +35,9 @@ def test_profiling_detects_and_masks_examples() -> None:
     assert any(e.endswith("1111") for e in examples.get("card_number", []))
 
     suggested = obj["suggested_rules"]
-    assert suggested["version"] == 1
+    assert suggested["version"] == 2
     assert isinstance(suggested["rules"], list)
-    assert all("search" in r and "replace" in r for r in suggested["rules"])
+    assert all("search" in r and "action" in r for r in suggested["rules"])
 
 
 def test_profiling_in_pipeline_writes_report_and_suggestions(tmp_path: Path) -> None:
@@ -59,7 +59,7 @@ def test_profiling_in_pipeline_writes_report_and_suggestions(tmp_path: Path) -> 
     assert "profiling_report" in res.profiling_report_path.name or res.profiling_report_path.name.endswith(".json")
 
     suggested = json.loads(res.suggested_rules_path.read_text(encoding="utf-8"))
-    assert suggested["version"] == 1
+    assert suggested["version"] == 2
 
 
 def test_profiling_disabled_has_no_side_effects(tmp_path: Path) -> None:

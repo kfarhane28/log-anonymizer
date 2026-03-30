@@ -96,6 +96,26 @@ def test_mask_keep_last_n(tmp_path: Path) -> None:
     assert out == "acct=************3456\n"
 
 
+def test_mask_group_only_keep_first(tmp_path: Path) -> None:
+    rules_json = {
+        "version": 2,
+        "rules": [
+            {
+                "description": "Mask email local-part (keep first char)",
+                "trigger": "@",
+                "search": r"\b([A-Za-z0-9._%+-]+)(@[A-Za-z0-9.-]+\.[A-Za-z]{2,})\b",
+                "action": {"type": "mask", "maskChar": "*", "keepFirst": 1, "group": 1},
+            }
+        ],
+    }
+    p = tmp_path / "rules.json"
+    p.write_text(json.dumps(rules_json), encoding="utf-8")
+    rules = load_rules(p, strict=True)
+
+    out, _ = anonymize_text_block("mail=carim@caissedesdepots.fr\n", rules)
+    assert out == "mail=c****@caissedesdepots.fr\n"
+
+
 def test_secure_hash_deterministic_with_context_salt(tmp_path: Path) -> None:
     rules_json = {
         "version": 2,

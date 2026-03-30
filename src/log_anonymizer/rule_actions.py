@@ -53,23 +53,29 @@ class MaskAction:
     mask_char: str = "*"
     keep_first: int = 0
     keep_last: int = 0
+    group: int = 0
 
     def as_replacement(self, *, context: ActionContext, rule_key: str) -> Replacement:
         mask_char = self.mask_char
         keep_first = self.keep_first
         keep_last = self.keep_last
+        group = self.group
 
         def _repl(match: re.Match[str]) -> str:
-            raw = match.group(0)
+            raw = match.group(group)
             if not raw:
-                return raw
+                return match.group(0) if group != 0 else raw
             n = len(raw)
             left = min(max(keep_first, 0), n)
             right = min(max(keep_last, 0), n - left)
             middle = n - left - right
             if middle <= 0:
-                return raw
-            return raw[:left] + (mask_char * middle) + raw[n - right :]
+                masked = raw
+            else:
+                masked = raw[:left] + (mask_char * middle) + raw[n - right :]
+            if group == 0:
+                return masked
+            return _replace_group_text(match, group=group, replacement=masked)
 
         return _repl
 
@@ -234,7 +240,12 @@ def parse_action(raw: Any) -> RuleAction:
             raise ValueError("action.keepLast must be an int >= 0")
         if not isinstance(keep_first, int) or keep_first < 0:
             raise ValueError("action.keepFirst must be an int >= 0")
-        return MaskAction(mask_char=mask_char, keep_first=keep_first, keep_last=keep_last)
+        group = raw.get("group", 0)
+        if not isinstance(group, int) or group < 0:
+            raise ValueError("action.group must be an int >= 0")
+        return MaskAction(
+            mask_char=mask_char, keep_first=keep_first, keep_last=keep_last, group=group
+        )
 
     if action_type == "secure_hash":
         algo = raw.get("algorithm", "sha256")
