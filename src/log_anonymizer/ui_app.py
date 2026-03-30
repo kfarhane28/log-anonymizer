@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import tomllib
 import json
 import hashlib
 import logging
@@ -243,6 +244,8 @@ def main() -> None:
             f"Rules file: `{run.rules_path.name if run.rules_path else 'default (built-in only)'}`"
         )
 
+    _render_footer()
+
 
 def _init_state() -> None:
     st.session_state.setdefault("log_queue", Queue())
@@ -296,6 +299,56 @@ def _init_state() -> None:
     # Backward-compat: older versions used a widget key named "preview_output".
     # Ensure it doesn't linger and cause confusing state errors across hot-reloads.
     st.session_state.pop("preview_output", None)
+
+
+def _get_app_version() -> str:
+    try:
+        from importlib import metadata
+
+        return "v" + metadata.version("log-anonymizer")
+    except Exception:
+        pass
+
+    try:
+        repo_root = Path(__file__).resolve().parents[2]
+        pyproject = repo_root / "pyproject.toml"
+        data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+        v = (
+            data.get("project", {})
+            .get("version", "")
+        )
+        if isinstance(v, str) and v.strip():
+            return "v" + v.strip()
+    except Exception:
+        pass
+
+    return "v?"
+
+
+def _render_footer() -> None:
+    version = _get_app_version()
+    st.markdown(
+        f"""
+        <style>
+          div.da-footer {{
+            position: fixed;
+            left: 12px;
+            bottom: 10px;
+            z-index: 1000;
+            opacity: 0.65;
+            font-size: 12px;
+            pointer-events: none;
+          }}
+          @media (prefers-color-scheme: dark) {{
+            div.da-footer {{
+              opacity: 0.55;
+            }}
+          }}
+        </style>
+        <div class="da-footer">Log Anonymizer {html.escape(version)}</div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def _render_sidebar() -> PreparedRun:
