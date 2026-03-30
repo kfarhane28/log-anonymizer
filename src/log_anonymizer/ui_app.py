@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import json
 import hashlib
 import logging
@@ -22,6 +23,7 @@ from log_anonymizer.input_handler import handle_input
 from log_anonymizer.exclude_filter import load_patterns as _load_exclude_patterns
 from log_anonymizer.application.preview_anonymization import (
     PreviewAnonymizationRequest,
+    PreviewLineDetail,
     preview_anonymization,
 )
 from log_anonymizer.profiling.profiler import ProfilingConfig, SensitiveDataProfiler
@@ -279,6 +281,8 @@ def _init_state() -> None:
     st.session_state.setdefault("preview_error", "")
     st.session_state.setdefault("preview_profile_report", "")
     st.session_state.setdefault("preview_suggested_rules", "")
+    st.session_state.setdefault("preview_line_details", ())
+    st.session_state.setdefault("preview_replacements_by_rule", {})
     st.session_state.setdefault("progress_stage", None)
     st.session_state.setdefault("progress_stage_current", None)
     st.session_state.setdefault("progress_stage_total", None)
@@ -999,6 +1003,8 @@ def _render_preview_tab(run: PreparedRun) -> None:
                 )
             )
             st.session_state["preview_output_value"] = res.anonymized_text
+            st.session_state["preview_line_details"] = res.line_details
+            st.session_state["preview_replacements_by_rule"] = dict(res.stats.replacements_by_rule)
             st.session_state["preview_status"] = (
                 f"Success. {res.lines_in} lines → {res.lines_out} lines "
                 f"({res.stats.total_replacements} replacements)."
@@ -1029,6 +1035,8 @@ def _render_preview_tab(run: PreparedRun) -> None:
         st.session_state["preview_error"] = ""
         st.session_state["preview_profile_report"] = ""
         st.session_state["preview_suggested_rules"] = ""
+        st.session_state["preview_line_details"] = ()
+        st.session_state["preview_replacements_by_rule"] = {}
         st.rerun()
 
     with status_slot:
@@ -1043,16 +1051,83 @@ def _render_preview_tab(run: PreparedRun) -> None:
         height=260,
         placeholder="Paste a few lines here…",
     )
-    st.text_area(
-        "Output (anonymized)",
-        value=text_out,
-        height=260,
-        disabled=True,
+
+    st.markdown(
+        """
+        <style>
+          div.da-preview-wrap {
+            border-radius: 10px;
+            border: 1px solid rgba(120, 120, 140, 0.25);
+            background: rgba(248, 249, 251, 1.0);
+            padding: 10px 12px;
+            max-height: 360px;
+            overflow: auto;
+          }
+          pre.da-preview {
+            font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+            font-size: 13px;
+            line-height: 1.38;
+            white-space: pre;
+            margin: 0;
+          }
+          span.da-mark {
+            display: inline-block;
+            width: 16px;
+            opacity: 0.45;
+          }
+          span.da-mark-on {
+            opacity: 1.0;
+            font-weight: 700;
+          }
+          span.da-hl {
+            background: rgba(255, 208, 77, 0.55);
+            border-bottom: 2px solid rgba(176, 106, 0, 0.95);
+            border-radius: 4px;
+            padding: 0 2px;
+          }
+          @media (prefers-color-scheme: dark) {
+            div.da-preview-wrap {
+              background: rgba(255, 255, 255, 0.04);
+              border-color: rgba(255, 255, 255, 0.10);
+            }
+            span.da-hl {
+              background: rgba(0, 169, 255, 0.35);
+              border-bottom: 2px solid rgba(0, 169, 255, 0.95);
+            }
+            span.da-mark-on {
+              color: rgba(0, 169, 255, 0.95);
+            }
+          }
+        </style>
+        """,
+        unsafe_allow_html=True,
     )
+
+    out_tabs = st.tabs(["Output (highlighted)", "Output (plain text)"])
+    with out_tabs[0]:
+        st.caption("Legend: highlighted text = anonymized content")
+        details: tuple[PreviewLineDetail, ...] = st.session_state.get("preview_line_details") or ()
+        if details:
+            st.markdown(_render_highlighted_preview(details), unsafe_allow_html=True)
+        else:
+            st.info("Run a preview to see highlighted output.")
+    with out_tabs[1]:
+        st.code(text_out or "", language="text")
     m1, m2, m3 = st.columns(3)
     m1.metric("Input lines", lines_in)
     m2.metric("Output lines", lines_out)
     m3.metric("User rules", _preview_rules_count(run))
+
+    repls_by_rule = st.session_state.get("preview_replacements_by_rule") or {}
+    if repls_by_rule:
+        with st.expander("Triggered rules (preview)", expanded=False):
+            rows = [
+                {"rule": k, "replacements": v}
+                for k, v in sorted(
+                    repls_by_rule.items(), key=lambda kv: (-int(kv[1]), str(kv[0]))
+                )
+            ]
+            st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
 
     if st.session_state.get("preview_profile_report"):
         with st.expander("Sensitive-data profiling report (preview)", expanded=False):
@@ -1078,6 +1153,38 @@ def _render_preview_tab(run: PreparedRun) -> None:
             """,
             height=44,
         )
+
+
+def _render_highlighted_preview(details: tuple[PreviewLineDetail, ...]) -> str:
+    """
+    Render the anonymized output with changed segments highlighted.
+
+    Uses HTML, but escapes all user content to avoid unsafe rendering.
+    """
+
+    def _hl_line(text: str, spans) -> str:
+        if not spans:
+            return html.escape(text)
+        out: list[str] = []
+        i = 0
+        for s in spans:
+            start = max(0, min(int(s.start), len(text)))
+            end = max(start, min(int(s.end), len(text)))
+            out.append(html.escape(text[i:start]))
+            out.append(
+                f'<span class="da-hl" title="Anonymized">{html.escape(text[start:end])}</span>'
+            )
+            i = end
+        out.append(html.escape(text[i:]))
+        return "".join(out)
+
+    lines = []
+    for d in details:
+        mark_cls = "da-mark da-mark-on" if d.changed_spans else "da-mark"
+        mark = f'<span class="{mark_cls}" title="Line changed">▍</span>'
+        lines.append(f"{mark}{_hl_line(d.anonymized, d.changed_spans)}")
+    body = "\n".join(lines)
+    return f'<div class="da-preview-wrap"><pre class="da-preview">{body}</pre></div>'
 
 
 def _preview_rules_count(run: PreparedRun) -> int:

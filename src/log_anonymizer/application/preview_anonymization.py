@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from log_anonymizer.anonymizer import AnonymizeTextStats, anonymize_text_block
+from log_anonymizer.application.preview_highlighting import ChangedSpan, compute_changed_spans
 from log_anonymizer.builtin_rules import default_rules, merge_rules
 from log_anonymizer.rules_loader import Rule, load_rules
 
@@ -25,6 +26,14 @@ class PreviewAnonymizationResult:
     lines_out: int
     rules_count: int
     stats: AnonymizeTextStats
+    line_details: tuple["PreviewLineDetail", ...]
+
+
+@dataclass(frozen=True)
+class PreviewLineDetail:
+    original: str
+    anonymized: str
+    changed_spans: tuple[ChangedSpan, ...]
 
 
 def preview_anonymization(req: PreviewAnonymizationRequest) -> PreviewAnonymizationResult:
@@ -61,12 +70,27 @@ def preview_anonymization(req: PreviewAnonymizationRequest) -> PreviewAnonymizat
         },
     )
 
+    in_lines = text.splitlines()
+    out_lines = anonymized_text.splitlines()
+    line_details: list[PreviewLineDetail] = []
+    for i in range(max(len(in_lines), len(out_lines))):
+        original = in_lines[i] if i < len(in_lines) else ""
+        anonymized = out_lines[i] if i < len(out_lines) else ""
+        line_details.append(
+            PreviewLineDetail(
+                original=original,
+                anonymized=anonymized,
+                changed_spans=compute_changed_spans(original, anonymized),
+            )
+        )
+
     return PreviewAnonymizationResult(
         anonymized_text=anonymized_text,
         lines_in=lines_in,
         lines_out=lines_out,
         rules_count=len(rules),
         stats=stats,
+        line_details=tuple(line_details),
     )
 
 
@@ -75,4 +99,3 @@ def _count_lines(text: str) -> int:
         return 0
     # Treat trailing newline as still representing a line (consistent with splitlines()).
     return len(text.splitlines())
-
