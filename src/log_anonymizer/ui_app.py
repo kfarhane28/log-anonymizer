@@ -1063,21 +1063,32 @@ def _render_preview_tab(run: PreparedRun) -> None:
             max-height: 360px;
             overflow: auto;
           }
-          pre.da-preview {
+          div.da-preview {
             font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
             font-size: 13px;
             line-height: 1.38;
-            white-space: pre;
             margin: 0;
+          }
+          div.da-line {
+            display: flex;
+            gap: 8px;
+            align-items: flex-start;
           }
           span.da-mark {
             display: inline-block;
             width: 16px;
             opacity: 0.45;
+            flex: 0 0 16px;
           }
           span.da-mark-on {
             opacity: 1.0;
             font-weight: 700;
+          }
+          span.da-text {
+            /* Keep explicit line breaks (one log line per line), but allow wrapping for long lines. */
+            white-space: pre-wrap;
+            word-break: break-word;
+            flex: 1 1 auto;
           }
           span.da-hl {
             background: rgba(255, 208, 77, 0.55);
@@ -1178,13 +1189,14 @@ def _render_highlighted_preview(details: tuple[PreviewLineDetail, ...]) -> str:
         out.append(html.escape(text[i:]))
         return "".join(out)
 
-    lines = []
+    lines: list[str] = []
     for d in details:
         mark_cls = "da-mark da-mark-on" if d.changed_spans else "da-mark"
         mark = f'<span class="{mark_cls}" title="Line changed">▍</span>'
-        lines.append(f"{mark}{_hl_line(d.anonymized, d.changed_spans)}")
+        text = f'<span class="da-text">{_hl_line(d.anonymized, d.changed_spans)}</span>'
+        lines.append(f'<div class="da-line">{mark}{text}</div>')
     body = "\n".join(lines)
-    return f'<div class="da-preview-wrap"><pre class="da-preview">{body}</pre></div>'
+    return f'<div class="da-preview-wrap"><div class="da-preview">{body}</div></div>'
 
 
 def _preview_rules_count(run: PreparedRun) -> int:
