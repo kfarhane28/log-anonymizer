@@ -15,6 +15,14 @@ logger = logging.getLogger(__name__)
 
 
 _INVALID_CHARS_RE = re.compile(r'[<>:"/\\\\|?*\x00-\x1F]')
+_WINDOWS_RESERVED_BASE_NAMES = {
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
 
 
 @dataclass(frozen=True)
@@ -78,7 +86,10 @@ class FilenameAnonymizer:
 
                 used = used_children.setdefault(anon_parent, set())
                 unique, did_collide = _make_unique_component(
-                    anon_name, used=used, suffix_source="/".join(orig_dir)
+                    anon_name,
+                    used=used,
+                    suffix_source="/".join(orig_dir),
+                    kind="dir",
                 )
                 used.add(unique)
                 if did_collide:
@@ -96,7 +107,10 @@ class FilenameAnonymizer:
 
             used = used_children.setdefault(anon_parent, set())
             unique_file, did_collide = _make_unique_component(
-                anon_file, used=used, suffix_source=rel.as_posix()
+                anon_file,
+                used=used,
+                suffix_source=rel.as_posix(),
+                kind="file",
             )
             used.add(unique_file)
             if did_collide:
@@ -117,8 +131,15 @@ class FilenameAnonymizer:
 
     def _anonymize_dir_component(self, name: str) -> tuple[str, bool]:
         anonymized, changed = self._apply_rules(name)
-        sanitized = _sanitize_component(anonymized)
-        return sanitized, changed or (sanitized != name)
+        anonymized = anonymized.strip()
+        if _is_safe_component(anonymized, kind="dir"):
+            return anonymized, changed or (anonymized != name)
+        fallback = _hash_fallback_component(
+            "d",
+            source=name,
+            salt=self._ctx.salt,
+        )
+        return fallback, True
 
     def _anonymize_file_component(self, name: str) -> tuple[str, bool]:
         stem, ext = _split_all_suffixes(name)
@@ -126,11 +147,20 @@ class FilenameAnonymizer:
             new_stem, changed = self._apply_rules(stem)
         else:
             new_stem, changed = stem, False
-        new_stem = _sanitize_component(new_stem) if new_stem else "_"
-        # Keep extension shape; still sanitize to avoid invalid bytes/controls.
+        new_stem = new_stem.strip()
+
         ext_s = _sanitize_extension(ext)
-        out = new_stem + ext_s
-        return out, changed or (out != name)
+        candidate = (new_stem or "") + ext_s
+        if _is_safe_component(candidate, kind="file"):
+            return candidate, changed or (candidate != name)
+
+        fallback_stem = _hash_fallback_component(
+            "f",
+            source=stem or name,
+            salt=self._ctx.salt,
+        )
+        out = fallback_stem + ext_s
+        return out, True
 
     def _apply_rules(self, s: str) -> tuple[str, bool]:
         if not s or not self._rules:
@@ -166,22 +196,49 @@ def _sanitize_extension(ext: str) -> str:
     return cleaned
 
 
-def _sanitize_component(name: str) -> str:
-    s = (name or "").strip()
-    s = s.replace("\x00", "")
-    s = _INVALID_CHARS_RE.sub("_", s)
-    # Avoid Windows-invalid trailing spaces/dots.
-    s = s.rstrip(" .")
+def _is_safe_component(name: str, *, kind: str) -> bool:
+    """
+    Conservative cross-platform check (Windows + POSIX).
+    If a component is not safe, we prefer a hash-based fallback instead of
+    lossy character replacement.
+    """
+    s = name or ""
     if not s:
-        return "_"
-    # Keep components reasonably bounded to common filesystem limits.
+        return False
+    if s != s.strip():
+        return False
+    if s in (".", ".."):
+        return False
+    if _INVALID_CHARS_RE.search(s) is not None:
+        return False
+    if s.endswith((" ", ".")):
+        return False
     if len(s) > 200:
-        h = hashlib.sha1(s.encode("utf-8", errors="replace")).hexdigest()[:10]
-        s = s[:180].rstrip(" .") + "__" + h
-    return s
+        return False
+
+    # Windows reserved device names (case-insensitive), based on the base name.
+    base = s
+    if kind == "file":
+        base, _ext = _split_all_suffixes(s)
+        base = base or s
+    base = base.split(".", 1)[0]
+    if base.upper() in _WINDOWS_RESERVED_BASE_NAMES:
+        return False
+    return True
 
 
-def _make_unique_component(name: str, *, used: set[str], suffix_source: str) -> tuple[str, bool]:
+def _hash_fallback_component(prefix: str, *, source: str, salt: str, length: int = 16) -> str:
+    h = hashlib.sha256()
+    h.update(salt.encode("utf-8", errors="replace"))
+    h.update(b":")
+    h.update(source.encode("utf-8", errors="replace"))
+    digest = h.hexdigest()[: max(8, int(length))]
+    return f"{prefix}_{digest}"
+
+
+def _make_unique_component(
+    name: str, *, used: set[str], suffix_source: str, kind: str
+) -> tuple[str, bool]:
     """
     Ensure a unique component name inside a directory.
     """
@@ -190,8 +247,11 @@ def _make_unique_component(name: str, *, used: set[str], suffix_source: str) -> 
 
     stem, ext = _split_all_suffixes(name)
     h = hashlib.sha1(suffix_source.encode("utf-8", errors="replace")).hexdigest()[:8]
-    base = _sanitize_component(stem) if stem else "_"
+    base = stem or "item"
     candidate = f"{base}__{h}{ext}"
+    if not _is_safe_component(candidate, kind=kind):
+        # As a last resort, use a compact hash-only name (still deterministic).
+        candidate = f"item__{h}{ext}"
     if candidate not in used:
         return candidate, True
 
@@ -199,6 +259,8 @@ def _make_unique_component(name: str, *, used: set[str], suffix_source: str) -> 
     i = 2
     while True:
         c = f"{base}__{h}__{i}{ext}"
+        if not _is_safe_component(c, kind=kind):
+            c = f"item__{h}__{i}{ext}"
         if c not in used:
             return c, True
         i += 1
