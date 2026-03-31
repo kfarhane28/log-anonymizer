@@ -359,6 +359,17 @@ log-anonymizer \
   --exclude examples/.exclude
 ```
 
+Anonymize file and folder names in the output (also sanitizes the output archive name):
+
+```bash
+log-anonymizer \
+  --input /path/to/support-bundle.tar.gz \
+  --output anonymized-out \
+  --rules examples/rules.json \
+  --exclude examples/.exclude \
+  --anonymize-filenames
+```
+
 ### Parallel processing (optional)
 
 By default, the tool processes files **sequentially**. For large bundles, you can enable parallel processing:

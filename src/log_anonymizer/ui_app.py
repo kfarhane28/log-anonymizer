@@ -52,6 +52,7 @@ class PreparedRun:
     profiling_detectors: tuple[str, ...]
     parallel_enabled: bool
     max_workers: int
+    anonymize_filenames: bool
 
 
 class _QueueHandler(logging.Handler):
@@ -215,7 +216,9 @@ def main() -> None:
         st.subheader("Output")
         st.write(f"Output directory: `{run.output_dir}`")
         if run.input_path is not None:
-            st.write(f"Output archive: `{_default_output_archive_path(run.output_dir, run.input_path)}`")
+            st.write(
+                f"Output archive: `{_default_output_archive_path(run.output_dir, run.input_path, anonymize_filenames=run.anonymize_filenames)}`"
+            )
         else:
             st.write("Output archive: (missing input)")
 
@@ -382,6 +385,11 @@ def _render_sidebar() -> PreparedRun:
     output_dir_text = st.sidebar.text_input("Output directory", value="tmp_test/ui_out")
     verbose = st.sidebar.checkbox("Verbose mode (DEBUG)", value=False)
     dry_run = st.sidebar.checkbox("Dry run", value=False)
+    anonymize_filenames = st.sidebar.checkbox(
+        "Anonymize file and folder names",
+        value=False,
+        help="Applies anonymization rules to output file/folder names (when possible) and also sanitizes the output archive name.",
+    )
     st.sidebar.markdown("### Performance")
     parallel_enabled = st.sidebar.checkbox(
         "Enable parallel file processing",
@@ -429,6 +437,7 @@ def _render_sidebar() -> PreparedRun:
         profiling_detectors=profiling_detectors,
         parallel_enabled=parallel_enabled,
         max_workers=max_workers,
+        anonymize_filenames=anonymize_filenames,
     )
     if st.session_state.get("ui_errors"):
         st.sidebar.markdown("---")
@@ -453,6 +462,7 @@ def _prepare_files(
     profiling_detectors: tuple[str, ...],
     parallel_enabled: bool,
     max_workers: int,
+    anonymize_filenames: bool,
 ) -> PreparedRun:
     tmp_dir = _ensure_tmp_dir()
 
@@ -509,6 +519,7 @@ def _prepare_files(
         profiling_detectors=profiling_detectors,
         parallel_enabled=parallel_enabled,
         max_workers=int(max_workers),
+        anonymize_filenames=bool(anonymize_filenames),
     )
 
 
@@ -554,8 +565,10 @@ def _atomic_write_bytes(target: Path, raw: bytes) -> None:
     os.replace(tmp, target)
 
 
-def _default_output_archive_path(output_dir: Path, input_path: Path) -> Path:
+def _default_output_archive_path(output_dir: Path, input_path: Path, *, anonymize_filenames: bool) -> Path:
     out_dir = output_dir.expanduser().resolve()
+    if anonymize_filenames:
+        return out_dir / "anonymized_output.tar.gz"
     name = input_path.name
     lower = name.lower()
     if lower.endswith(".tar.gz"):
@@ -732,6 +745,7 @@ def _run_pipeline_thread(
             exclude_case_insensitive=False,
             include_builtin_rules=True,
             profile_sensitive_data=bool(run.profile_sensitive_data),
+            anonymize_filenames=bool(run.anonymize_filenames),
             profiling_detectors=run.profiling_detectors,
             cancellation_token=cancel_token,
             rollback_on_cancel=False,
@@ -815,17 +829,9 @@ def _dry_run(run: PreparedRun) -> str:
         )
         filtered = [f for f in files if not (exclude_filter and exclude_filter.should_exclude(f))]
 
-    name = run.input_path.name
-    lower = name.lower()
-    if lower.endswith(".tar.gz"):
-        base = name[: -len(".tar.gz")]
-    elif lower.endswith(".tgz"):
-        base = name[: -len(".tgz")]
-    elif lower.endswith(".zip"):
-        base = run.input_path.stem
-    else:
-        base = run.input_path.stem or name
-    zip_path = run.output_dir.expanduser().resolve() / f"{base}.tar.gz"
+    zip_path = _default_output_archive_path(
+        run.output_dir, run.input_path, anonymize_filenames=bool(run.anonymize_filenames)
+    )
     exclude_info = f"builtin={len(default_patterns())}"
     if run.exclude_path is not None:
         try:

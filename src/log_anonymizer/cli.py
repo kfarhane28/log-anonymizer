@@ -103,6 +103,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Enable parallel processing of files (default: disabled, sequential).",
     )
     parser.add_argument(
+        "--anonymize-filenames",
+        action="store_true",
+        help="Anonymize file and folder names in the output (also sanitizes the output archive name).",
+    )
+    parser.add_argument(
         "--max-workers",
         type=int,
         default=5,
@@ -195,6 +200,7 @@ def main(argv: list[str] | None = None) -> None:
                 exclude_path=exclude_path,
                 exclude_case_insensitive=bool(args.exclude_case_insensitive),
                 include_builtin=not bool(args.no_default_rules),
+                anonymize_filenames=bool(args.anonymize_filenames),
             )
             return
 
@@ -209,6 +215,7 @@ def main(argv: list[str] | None = None) -> None:
             exclude_case_insensitive=bool(args.exclude_case_insensitive),
             include_builtin_rules=not bool(args.no_default_rules),
             profile_sensitive_data=bool(args.profile_sensitive_data),
+            anonymize_filenames=bool(args.anonymize_filenames),
             profiling_detectors=detectors,
             profiling_report_path=args.profiling_report.resolve()
             if args.profiling_report is not None
@@ -266,6 +273,7 @@ def _dry_run(
     exclude_path: Path | None,
     exclude_case_insensitive: bool,
     include_builtin: bool,
+    anonymize_filenames: bool,
 ) -> None:
     """
     Dry-run mode: validate inputs, load rules, apply excludes, and report what would be done.
@@ -293,7 +301,7 @@ def _dry_run(
         )
         filtered = [f for f in files if not (exclude_filter and exclude_filter.should_exclude(f))]
 
-    zip_path = _default_output_archive_path(output_dir, input_path)
+    zip_path = _default_output_archive_path(output_dir, input_path, anonymize_filenames=anonymize_filenames)
     print("DRY RUN")
     print(f"- Input: {input_path}")
     print(f"- Output dir: {output_dir}")
@@ -311,8 +319,12 @@ def _die(message: str) -> "NoReturn":
     raise SystemExit(2)
 
 
-def _default_output_archive_path(output_dir: Path, input_path: Path) -> Path:
+def _default_output_archive_path(
+    output_dir: Path, input_path: Path, *, anonymize_filenames: bool
+) -> Path:
     out_dir = output_dir.resolve()
+    if anonymize_filenames:
+        return out_dir / "anonymized_output.tar.gz"
     name = input_path.name
     lower = name.lower()
     if lower.endswith(".tar.gz"):

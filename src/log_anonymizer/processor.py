@@ -18,6 +18,7 @@ from log_anonymizer.anonymizer import (
 )
 from log_anonymizer.builtin_rules import default_rules, merge_rules
 from log_anonymizer.exclude_filter import ExcludeFilter, default_patterns, load_patterns
+from log_anonymizer.filename_anonymizer import FilenameAnonymizer
 from log_anonymizer.input_handler import handle_input
 from log_anonymizer.profiling.profiler import ProfilingConfig, SensitiveDataProfiler
 from log_anonymizer.rules_loader import Rule, load_rules
@@ -44,6 +45,7 @@ class ProcessorConfig:
     exclude_case_insensitive: bool = False
     include_builtin_rules: bool = True
     profile_sensitive_data: bool = False
+    anonymize_filenames: bool = False
     profiling_detectors: tuple[str, ...] = ("email", "ipv4", "token", "card")
     profiling_report_path: Path | None = None
     suggest_rules_output_path: Path | None = None
@@ -147,7 +149,12 @@ def process_with_result(
         raise ValueError(f"--output must be a directory: {output_root}")
     output_root.mkdir(parents=True, exist_ok=True)
 
-    out_zip = _resolve_output_archive_path(output_root, input_path, output_zip_path)
+    out_zip = _resolve_output_archive_path(
+        output_root,
+        input_path,
+        output_zip_path,
+        anonymize_filenames=bool(cfg.anonymize_filenames),
+    )
     out_zip.parent.mkdir(parents=True, exist_ok=True)
 
     if progress is not None:
@@ -225,6 +232,37 @@ def process_with_result(
 
             if anonymize_files and not rules:
                 raise ValueError("No valid rules loaded; refusing to process.")
+
+            output_relpath_for = None
+            if cfg.anonymize_filenames:
+                rels = [_safe_relative(p, working_dir) for p in included_files]
+                fn = FilenameAnonymizer(rules=rules, action_context=action_context)
+                rel_map, stats = fn.build_relpath_map(rels)
+                logger.info(
+                    "filename_anonymization_enabled",
+                    extra={
+                        "paths_total": stats.paths_total,
+                        "paths_changed": stats.paths_changed,
+                        "components_changed": stats.components_changed,
+                        "collisions_resolved": stats.collisions_resolved,
+                    },
+                )
+                changed = [(k, v) for k, v in rel_map.items() if k.as_posix() != v.as_posix()]
+                if changed:
+                    for k, v in changed[:80]:
+                        logger.debug(
+                            "filename_anonymized",
+                            extra={"rel": k.as_posix(), "out_rel": v.as_posix()},
+                        )
+                    if len(changed) > 80:
+                        logger.debug(
+                            "filename_anonymized_truncated",
+                            extra={"shown": 80, "remaining": len(changed) - 80},
+                        )
+
+                def output_relpath_for(p: Path) -> Path:  # type: ignore[misc]
+                    rel = Path(_safe_relative(p, working_dir).as_posix())
+                    return rel_map.get(rel, rel)
 
             logger.info(
                 "pipeline_files_filtered",
@@ -314,6 +352,7 @@ def process_with_result(
                 on_file_done=_on_file_done,
                 cancel_requested=lambda: _is_cancelled(cfg),
                 action_context=action_context,
+                output_relpath_for=output_relpath_for,
             )
             cancelled = cancelled or anonymized_cancelled > 0 or _is_cancelled(cfg)
 
@@ -330,6 +369,7 @@ def process_with_result(
                     progress=progress,
                     on_file_done=_on_file_done,
                     cancel_requested=lambda: _is_cancelled(cfg),
+                    output_relpath_for=output_relpath_for,
                 )
                 cancelled = cancelled or passthrough_cancelled > 0 or _is_cancelled(cfg)
 
@@ -477,6 +517,7 @@ def _copy_passthrough_files(
     progress: ProgressReporter | None = None,
     on_file_done: Callable[[bool], None] | None = None,
     cancel_requested: Callable[[], bool] | None = None,
+    output_relpath_for: Callable[[Path], Path] | None = None,
 ) -> tuple[int, int, int]:
     if not files:
         return 0, 0, 0
@@ -486,7 +527,8 @@ def _copy_passthrough_files(
             if cancel_requested is not None and cancel_requested():
                 return "cancelled"
             rel = _safe_relative(src, working_dir)
-            dest = output_dir / rel
+            out_rel = output_relpath_for(src) if output_relpath_for is not None else rel
+            dest = output_dir / out_rel
             dest.parent.mkdir(parents=True, exist_ok=True)
             if progress is not None:
                 try:
@@ -497,7 +539,7 @@ def _copy_passthrough_files(
                     now_event(
                         kind=ProgressKind.FILE_START,
                         stage=ProgressStage.PROCESSING,
-                        path=rel.as_posix(),
+                        path=out_rel.as_posix(),
                         bytes_done=0,
                         bytes_total=size_bytes,
                         message="passthrough_start",
@@ -509,6 +551,7 @@ def _copy_passthrough_files(
                     "file_name": src.name,
                     "path": str(src),
                     "rel": rel.as_posix(),
+                    "out_rel": out_rel.as_posix(),
                     "dest": str(dest),
                 },
             )
@@ -519,7 +562,7 @@ def _copy_passthrough_files(
                         now_event(
                             kind=ProgressKind.FILE_END,
                             stage=ProgressStage.PROCESSING,
-                            path=rel.as_posix(),
+                            path=out_rel.as_posix(),
                             ok=False,
                             message="passthrough_cancelled",
                         )
@@ -531,6 +574,7 @@ def _copy_passthrough_files(
                     "file_name": src.name,
                     "path": str(src),
                     "rel": rel.as_posix(),
+                    "out_rel": out_rel.as_posix(),
                     "dest": str(dest),
                 },
             )
@@ -539,7 +583,7 @@ def _copy_passthrough_files(
                     now_event(
                         kind=ProgressKind.FILE_END,
                         stage=ProgressStage.PROCESSING,
-                        path=rel.as_posix(),
+                        path=out_rel.as_posix(),
                         ok=True,
                         message="passthrough_done",
                     )
@@ -555,7 +599,9 @@ def _copy_passthrough_files(
                     now_event(
                         kind=ProgressKind.FILE_END,
                         stage=ProgressStage.PROCESSING,
-                        path=_safe_relative(src, working_dir).as_posix(),
+                        path=(
+                            (output_relpath_for(src) if output_relpath_for is not None else rel)
+                        ).as_posix(),
                         ok=False,
                         message="passthrough_failed",
                     )
@@ -627,6 +673,7 @@ def _process_files_parallel(
     on_file_done: Callable[[bool], None] | None = None,
     cancel_requested: Callable[[], bool] | None = None,
     action_context: ActionContext | None = None,
+    output_relpath_for: Callable[[Path], Path] | None = None,
 ) -> tuple[int, int, int]:
     if not files:
         return 0, 0, 0
@@ -636,14 +683,15 @@ def _process_files_parallel(
             if cancel_requested is not None and cancel_requested():
                 return "cancelled"
             rel = _safe_relative(src, working_dir)
-            dest = output_dir / rel
+            out_rel = output_relpath_for(src) if output_relpath_for is not None else rel
+            dest = output_dir / out_rel
             try:
                 anonymize_file(
                     src,
                     dest,
                     rules,
                     progress=progress,
-                    rel_path=rel.as_posix(),
+                    rel_path=out_rel.as_posix(),
                     cancel_requested=cancel_requested,
                     action_context=action_context,
                 )
@@ -832,13 +880,30 @@ def _is_tar_gz_path(path: Path) -> bool:
     return name.endswith(".tar.gz") or name.endswith(".tgz")
 
 
-def _resolve_output_archive_path(output_dir: Path, input_path: Path, output_zip_path: Path | None) -> Path:
+def _resolve_output_archive_path(
+    output_dir: Path,
+    input_path: Path,
+    output_zip_path: Path | None,
+    *,
+    anonymize_filenames: bool,
+) -> Path:
     """
     Resolve the output archive path (tar.gz) such that the CLI output is a single archive
     inside `output_dir`.
     """
     output_dir = output_dir.resolve()
     if output_zip_path is None:
+        if anonymize_filenames:
+            base = "anonymized_output"
+            out = (output_dir / f"{base}.tar.gz").resolve()
+            if not out.exists():
+                return out
+            i = 2
+            while True:
+                candidate = (output_dir / f"{base}__{i}.tar.gz").resolve()
+                if not candidate.exists():
+                    return candidate
+                i += 1
         base = _archive_base_name(input_path)
         return (output_dir / f"{base}.tar.gz").resolve()
 
