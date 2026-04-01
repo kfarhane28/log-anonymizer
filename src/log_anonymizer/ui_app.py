@@ -29,20 +29,21 @@ from log_anonymizer.application.preview_anonymization import (
 )
 from log_anonymizer.profiling.profiler import ProfilingConfig, SensitiveDataProfiler
 from log_anonymizer.profiling.runner import run_sensitive_data_profiling
+from log_anonymizer.batch import process_batch_with_result
 from log_anonymizer.processor import CancellationToken, ProcessorConfig, process_with_result
 from log_anonymizer.progress import ProgressEvent, ProgressKind, ProgressStage, QueueProgressReporter
 from log_anonymizer.rules_loader import load_rules
 from log_anonymizer.rules_validation import validate_rules_json_bytes
 
 
-InputMode = Literal["Upload file", "Upload archive", "Use path"]
+InputMode = Literal["Upload", "Use path(s)"]
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
 class PreparedRun:
-    input_path: Path | None
+    input_paths: list[Path]
     rules_path: Path
     exclude_path: Path | None
     output_dir: Path
@@ -53,6 +54,8 @@ class PreparedRun:
     parallel_enabled: bool
     max_workers: int
     anonymize_filenames: bool
+    batch_parallel_enabled: bool
+    batch_max_workers: int
 
 
 class _QueueHandler(logging.Handler):
@@ -122,6 +125,11 @@ def main() -> None:
             st.session_state["run_status"] = ""
             st.session_state["result_zip_bytes"] = None
             st.session_state["result_zip_name"] = None
+            st.session_state["batch_items"] = None
+            st.session_state["profiling_report_bytes"] = None
+            st.session_state["profiling_report_name"] = None
+            st.session_state["suggested_rules_bytes"] = None
+            st.session_state["suggested_rules_name"] = None
             st.rerun()
 
         if st.session_state.get("run_status"):
@@ -215,16 +223,20 @@ def main() -> None:
     with right:
         st.subheader("Output")
         st.write(f"Output directory: `{run.output_dir}`")
-        if run.input_path is not None:
+        if len(run.input_paths) == 1:
             st.write(
-                f"Output archive: `{_default_output_archive_path(run.output_dir, run.input_path, anonymize_filenames=run.anonymize_filenames)}`"
+                f"Output archive: `{_default_output_archive_path(run.output_dir, run.input_paths[0], anonymize_filenames=run.anonymize_filenames)}`"
             )
+        elif len(run.input_paths) > 1:
+            st.write("Batch output: one subfolder per input (plus `batch_summary.json`).")
         else:
             st.write("Output archive: (missing input)")
 
-        has_any_output = any(
-            st.session_state.get(k) is not None
-            for k in ("result_zip_bytes", "profiling_report_bytes", "suggested_rules_bytes")
+        has_any_output = (
+            st.session_state.get("result_zip_bytes") is not None
+            or st.session_state.get("batch_items") is not None
+            or st.session_state.get("profiling_report_bytes") is not None
+            or st.session_state.get("suggested_rules_bytes") is not None
         )
         if has_any_output:
             st.success("Done.")
@@ -237,6 +249,26 @@ def main() -> None:
                 mime="application/gzip",
                 width="stretch",
             )
+
+        batch_items = st.session_state.get("batch_items")
+        if isinstance(batch_items, list) and batch_items:
+            st.markdown("### Batch outputs")
+            for it in batch_items:
+                name = str(it.get("input_name") or it.get("input_path") or "input")
+                status = str(it.get("status") or "")
+                out_path = it.get("output_archive")
+                if status.lower() == "success" and isinstance(out_path, str) and out_path:
+                    p = Path(out_path)
+                    if p.exists():
+                        st.download_button(
+                            f"Download: {name}",
+                            data=_read_bytes_cached(str(p)),
+                            file_name=p.name,
+                            mime="application/gzip",
+                            width="stretch",
+                        )
+                else:
+                    st.caption(f"{name}: {status}")
 
         st.subheader("Run")
         st.write(f"Verbose: `{run.verbose}`")
@@ -264,6 +296,11 @@ def _init_state() -> None:
     st.session_state.setdefault("profiling_report_name", None)
     st.session_state.setdefault("suggested_rules_bytes", None)
     st.session_state.setdefault("suggested_rules_name", None)
+    st.session_state.setdefault("batch_items", None)
+    st.session_state.setdefault("batch_mode", False)
+    st.session_state.setdefault("batch_current_input", "")
+    st.session_state.setdefault("batch_done", 0)
+    st.session_state.setdefault("batch_total", None)
     st.session_state.setdefault("tmp_dir", None)
     st.session_state.setdefault("log_handler", None)
     st.session_state.setdefault("log_prev_handlers", None)
@@ -279,8 +316,6 @@ def _init_state() -> None:
     st.session_state.setdefault("exclude_editor_df", None)
     st.session_state.setdefault("rules_upload_sig", None)
     st.session_state.setdefault("exclude_upload_sig", None)
-    st.session_state.setdefault("input_upload_sig", None)
-    st.session_state.setdefault("input_upload_path", None)
     st.session_state.setdefault("preview_input", "")
     st.session_state.setdefault("preview_output_value", "")
     st.session_state.setdefault("preview_status", "")
@@ -361,21 +396,24 @@ def _render_sidebar() -> PreparedRun:
 
     input_mode: InputMode = st.sidebar.radio(
         "Input source",
-        options=["Upload file", "Upload archive", "Use path"],
+        options=["Upload", "Use path(s)"],
         index=0,
     )
 
-    uploaded_input = None
-    input_path_text = ""
-    if input_mode == "Upload file":
-        uploaded_input = st.sidebar.file_uploader("Upload a log file", type=None)
-    elif input_mode == "Upload archive":
-        uploaded_input = st.sidebar.file_uploader(
-            "Upload an archive (.zip / .tar.gz)",
-            type=["zip", "tgz", "gz"],
+    uploaded_inputs = None
+    input_paths_text = ""
+    if input_mode == "Upload":
+        uploaded_inputs = st.sidebar.file_uploader(
+            "Upload one or more inputs (files and/or archives)",
+            type=None,
+            accept_multiple_files=True,
         )
     else:
-        input_path_text = st.sidebar.text_input("Input path", value="tmp_test/in")
+        input_paths_text = st.sidebar.text_area(
+            "Input path(s) (one per line)",
+            value="tmp_test/in",
+            height=110,
+        )
 
     uploaded_rules = st.sidebar.file_uploader("Rules JSON", type=["json"], key="rules_upload")
     uploaded_exclude = st.sidebar.file_uploader(
@@ -391,6 +429,22 @@ def _render_sidebar() -> PreparedRun:
         help="Applies anonymization rules to output file/folder names (when possible) and also sanitizes the output archive name.",
     )
     st.sidebar.markdown("### Performance")
+    batch_parallel_enabled = st.sidebar.checkbox(
+        "Enable parallel input processing (batch)",
+        value=False,
+        help="Runs multiple top-level inputs concurrently. Separate from per-file parallelism inside each input.",
+    )
+    batch_max_workers = int(
+        st.sidebar.number_input(
+            "Max parallel inputs",
+            min_value=1,
+            max_value=16,
+            value=2,
+            step=1,
+            disabled=not batch_parallel_enabled,
+            help="Only used when batch parallelism is enabled (default: 2).",
+        )
+    )
     parallel_enabled = st.sidebar.checkbox(
         "Enable parallel file processing",
         value=False,
@@ -426,8 +480,8 @@ def _render_sidebar() -> PreparedRun:
 
     prepared = _prepare_files(
         input_mode=input_mode,
-        uploaded_input=uploaded_input,
-        input_path_text=input_path_text,
+        uploaded_inputs=uploaded_inputs,
+        input_paths_text=input_paths_text,
         uploaded_rules=uploaded_rules,
         uploaded_exclude=uploaded_exclude,
         output_dir_text=output_dir_text,
@@ -435,6 +489,8 @@ def _render_sidebar() -> PreparedRun:
         dry_run=dry_run,
         profile_sensitive_data=profile_sensitive_data,
         profiling_detectors=profiling_detectors,
+        batch_parallel_enabled=batch_parallel_enabled,
+        batch_max_workers=batch_max_workers,
         parallel_enabled=parallel_enabled,
         max_workers=max_workers,
         anonymize_filenames=anonymize_filenames,
@@ -451,8 +507,8 @@ def _render_sidebar() -> PreparedRun:
 def _prepare_files(
     *,
     input_mode: InputMode,
-    uploaded_input,
-    input_path_text: str,
+    uploaded_inputs,
+    input_paths_text: str,
     uploaded_rules,
     uploaded_exclude,
     output_dir_text: str,
@@ -460,24 +516,26 @@ def _prepare_files(
     dry_run: bool,
     profile_sensitive_data: bool,
     profiling_detectors: tuple[str, ...],
+    batch_parallel_enabled: bool,
+    batch_max_workers: int,
     parallel_enabled: bool,
     max_workers: int,
     anonymize_filenames: bool,
 ) -> PreparedRun:
     tmp_dir = _ensure_tmp_dir()
 
-    if input_mode in ("Upload file", "Upload archive"):
-        if uploaded_input is None:
-            input_path = None
-        else:
-            if input_mode == "Upload archive":
-                name_hint = str(getattr(uploaded_input, "name", "") or "input.tar.gz")
-            else:
-                name_hint = str(getattr(uploaded_input, "name", "") or "input")
-            input_path = _save_upload_cached(tmp_dir, uploaded_input, name_hint=name_hint)
+    input_paths: list[Path] = []
+    if input_mode == "Upload":
+        if uploaded_inputs:
+            input_paths = _save_uploads_cached(tmp_dir, uploaded_inputs)
     else:
-        raw = (input_path_text or "").strip()
-        input_path = Path(raw).expanduser() if raw else None
+        raw = (input_paths_text or "").strip()
+        if raw:
+            for line in raw.splitlines():
+                s = (line or "").strip()
+                if not s:
+                    continue
+                input_paths.append(Path(s).expanduser())
 
     if uploaded_rules is None:
         _ensure_rules_editor_initialized()
@@ -509,7 +567,7 @@ def _prepare_files(
 
     output_dir = Path(output_dir_text).expanduser()
     return PreparedRun(
-        input_path=input_path,
+        input_paths=input_paths,
         rules_path=rules_path,
         exclude_path=exclude_path,
         output_dir=output_dir,
@@ -520,6 +578,8 @@ def _prepare_files(
         parallel_enabled=parallel_enabled,
         max_workers=int(max_workers),
         anonymize_filenames=bool(anonymize_filenames),
+        batch_parallel_enabled=bool(batch_parallel_enabled),
+        batch_max_workers=int(batch_max_workers),
     )
 
 
@@ -544,18 +604,18 @@ def _save_upload_cached(tmp_dir: Path, uploaded, *, name_hint: str) -> Path:
     safe_name = Path(name_hint).name
     sig = _sig(safe_name, raw)
 
-    prev_sig = st.session_state.get("input_upload_sig")
-    prev_path = st.session_state.get("input_upload_path")
-    if prev_sig == sig and isinstance(prev_path, str) and prev_path:
-        p = Path(prev_path)
-        if p.exists():
-            return p
-
     target = (tmp_dir / f"input-{sig[:12]}-{safe_name}").resolve()
-    _atomic_write_bytes(target, raw)
-    st.session_state["input_upload_sig"] = sig
-    st.session_state["input_upload_path"] = str(target)
+    if not target.exists():
+        _atomic_write_bytes(target, raw)
     return target
+
+
+def _save_uploads_cached(tmp_dir: Path, uploaded_list) -> list[Path]:
+    out: list[Path] = []
+    for up in list(uploaded_list or []):
+        name_hint = str(getattr(up, "name", "") or "input")
+        out.append(_save_upload_cached(tmp_dir, up, name_hint=name_hint))
+    return out
 
 
 def _atomic_write_bytes(target: Path, raw: bytes) -> None:
@@ -601,6 +661,11 @@ def _start_run(run: PreparedRun) -> None:
     st.session_state["progress_file_done"] = None
     st.session_state["progress_file_total"] = None
     st.session_state["cancel_token"] = None
+    st.session_state["batch_mode"] = len(run.input_paths) > 1
+    st.session_state["batch_items"] = None
+    st.session_state["batch_current_input"] = ""
+    st.session_state["batch_done"] = 0
+    st.session_state["batch_total"] = len(run.input_paths) if run.input_paths else None
 
     err = _validate_run(run)
     if err:
@@ -662,16 +727,15 @@ def _validate_run(run: PreparedRun) -> str | None:
     ui_errors = st.session_state.get("ui_errors") or []
     if ui_errors:
         return str(ui_errors[0])
-    if run.input_path is None:
-        return "Please provide an input (upload or path)."
-    if str(run.input_path).strip() in ("", "."):
-        return "Please provide an input (upload or path)."
-    if not run.input_path.exists():
-        return f"Input path does not exist: {run.input_path}"
+    if not run.input_paths:
+        return "Please provide at least one input (upload or paths)."
+    for p in run.input_paths:
+        if str(p).strip() in ("", "."):
+            return "Please provide valid input path(s)."
+        if not p.exists():
+            return f"Input path does not exist: {p}"
     if not run.output_dir or str(run.output_dir) == "":
         return "Please provide an output directory."
-    if not run.input_path.exists():
-        return f"Input path does not exist: {run.input_path}"
     if run.output_dir.exists() and not run.output_dir.is_dir():
         return f"Output directory is not a directory: {run.output_dir}"
     if not run.rules_path.exists():
@@ -690,8 +754,8 @@ def _run_pipeline_thread(
 ) -> None:
     try:
         t0 = time.perf_counter()
-        if run.input_path is None:
-            outcome_q.put({"type": "error", "status": "Failed.", "error": "Missing input."})
+        if not run.input_paths:
+            outcome_q.put({"type": "error", "status": "Failed.", "error": "Missing input(s)."})
             return
         if cancel_token.is_cancelled():
             outcome_q.put(
@@ -705,35 +769,42 @@ def _run_pipeline_thread(
             )
             return
         if run.dry_run:
-            if run.profile_sensitive_data and run.input_path is not None:
-                res = run_sensitive_data_profiling(
-                    input_path=run.input_path,
-                    output_dir=run.output_dir,
-                    exclude_path=run.exclude_path,
-                    detectors=run.profiling_detectors,
-                )
-                elapsed_s = int(round(time.perf_counter() - t0))
-                summary = (
-                    "DRY RUN (profiling only)\n"
-                    f"- Profiling report: {res.profiling_report_path}\n"
-                    f"- Suggested rules: {res.suggested_rules_path}\n"
-                    f"- Duration: {elapsed_s}s\n"
-                    f"- Files: total={res.total_files}, excluded={res.excluded_files}, profiled={res.profiled_files}\n"
-                )
-                log_q.put(summary)
+            elapsed_s = int(round(time.perf_counter() - t0))
+            if run.profile_sensitive_data:
+                lines = ["DRY RUN (profiling only)"]
+                for p in run.input_paths:
+                    res = run_sensitive_data_profiling(
+                        input_path=p,
+                        output_dir=run.output_dir,
+                        exclude_path=run.exclude_path,
+                        detectors=run.profiling_detectors,
+                    )
+                    lines.append(f"- Input: {p}")
+                    lines.append(f"  - Profiling report: {res.profiling_report_path}")
+                    lines.append(f"  - Suggested rules: {res.suggested_rules_path}")
+                    lines.append(
+                        f"  - Files: total={res.total_files}, excluded={res.excluded_files}, profiled={res.profiled_files}"
+                    )
+                lines.append(f"- Duration: {elapsed_s}s")
+                log_q.put("\n".join(lines) + "\n")
                 outcome_q.put(
                     {
                         "type": "done",
                         "status": "Dry run (profiling only) completed.",
                         "archive_path": None,
-                        "profiling_report_path": str(res.profiling_report_path),
-                        "suggested_rules_path": str(res.suggested_rules_path),
                     }
                 )
                 return
 
-            elapsed_s = int(round(time.perf_counter() - t0))
-            summary = _dry_run(run)
+            if len(run.input_paths) == 1:
+                summary = _dry_run_single(run, run.input_paths[0])
+            else:
+                parts = ["DRY RUN (batch)", f"- Inputs: {len(run.input_paths)}"]
+                for p in run.input_paths:
+                    block = _dry_run_single(run, p).rstrip("\n")
+                    lines = block.splitlines()
+                    parts.append("\n".join(lines[1:] if len(lines) > 1 else lines))
+                summary = "\n".join(parts) + "\n"
             summary = summary.rstrip("\n") + f"\n- Duration: {elapsed_s}s\n"
             log_q.put(summary)
             outcome_q.put({"type": "done", "status": "Dry run completed.", "archive_path": None})
@@ -751,57 +822,103 @@ def _run_pipeline_thread(
             rollback_on_cancel=False,
         )
         reporter = QueueProgressReporter(progress_q)
-        result = process_with_result(
-            input_path=run.input_path,
+        if len(run.input_paths) == 1:
+            result = process_with_result(
+                input_path=run.input_paths[0],
+                rules_path=run.rules_path,
+                output_dir=run.output_dir,
+                exclude_path=run.exclude_path,
+                config=cfg,
+                progress=reporter,
+            )
+            elapsed_s = int(round(time.perf_counter() - t0))
+            if result.cancelled and result.rolled_back:
+                title = "Cancelled and rolled back."
+            elif result.cancelled:
+                title = "Cancelled with partial output kept."
+            else:
+                title = "Completed."
+            summary_lines = [title]
+            if result.output_zip.exists():
+                summary_lines.append(f"- Output archive: {result.output_zip}")
+            summary_lines.append(f"- Duration: {elapsed_s}s")
+            if result.profiling_report_path:
+                summary_lines.append(f"- Profiling report: {result.profiling_report_path}")
+            if result.suggested_rules_path:
+                summary_lines.append(f"- Suggested rules: {result.suggested_rules_path}")
+            summary_lines.extend(
+                [
+                    f"- Total files: {result.total_files}",
+                    f"- Excluded: {result.excluded_files}",
+                    f"- Processed: {result.processed_files}",
+                    f"- Failed: {result.failed_files}",
+                ]
+            )
+            summary = "\n".join(summary_lines)
+            outcome_q.put(
+                {
+                    "type": "done",
+                    "status": summary,
+                    "archive_path": str(result.output_zip) if result.output_zip.exists() else None,
+                    "profiling_report_path": str(result.profiling_report_path)
+                    if result.profiling_report_path is not None
+                    else None,
+                    "suggested_rules_path": str(result.suggested_rules_path)
+                    if result.suggested_rules_path is not None
+                    else None,
+                    "cancelled": bool(result.cancelled),
+                    "rolled_back": bool(result.rolled_back),
+                    "summary": {
+                        "total": result.total_files,
+                        "excluded": result.excluded_files,
+                        "processed": result.processed_files,
+                        "failed": result.failed_files,
+                    },
+                }
+            )
+            return
+
+        batch = process_batch_with_result(
+            inputs=run.input_paths,
             rules_path=run.rules_path,
             output_dir=run.output_dir,
             exclude_path=run.exclude_path,
             config=cfg,
+            batch_parallel_enabled=bool(run.batch_parallel_enabled),
+            batch_max_workers=int(run.batch_max_workers or 2),
             progress=reporter,
         )
         elapsed_s = int(round(time.perf_counter() - t0))
-        if result.cancelled and result.rolled_back:
-            title = "Cancelled and rolled back."
-        elif result.cancelled:
-            title = "Cancelled with partial output kept."
-        else:
-            title = "Completed."
-        summary_lines = [title]
-        if result.output_zip.exists():
-            summary_lines.append(f"- Output archive: {result.output_zip}")
-        summary_lines.append(f"- Duration: {elapsed_s}s")
-        if result.profiling_report_path:
-            summary_lines.append(f"- Profiling report: {result.profiling_report_path}")
-        if result.suggested_rules_path:
-            summary_lines.append(f"- Suggested rules: {result.suggested_rules_path}")
-        summary_lines.extend(
-            [
-                f"- Total files: {result.total_files}",
-                f"- Excluded: {result.excluded_files}",
-                f"- Processed: {result.processed_files}",
-                f"- Failed: {result.failed_files}",
-            ]
-        )
-        summary = "\n".join(summary_lines)
+        summary_lines = [
+            "Batch completed.",
+            f"- Batch directory: {batch.batch_dir}",
+            f"- Duration: {elapsed_s}s",
+            f"- Inputs: total={batch.total} ok={batch.succeeded} failed={batch.failed} cancelled={batch.cancelled} skipped={batch.skipped}",
+            f"- Summary JSON: {batch.summary_path}",
+        ]
         outcome_q.put(
             {
                 "type": "done",
-                "status": summary,
-                "archive_path": str(result.output_zip) if result.output_zip.exists() else None,
-                "profiling_report_path": str(result.profiling_report_path)
-                if result.profiling_report_path is not None
-                else None,
-                "suggested_rules_path": str(result.suggested_rules_path)
-                if result.suggested_rules_path is not None
-                else None,
-                "cancelled": bool(result.cancelled),
-                "rolled_back": bool(result.rolled_back),
-                "summary": {
-                    "total": result.total_files,
-                    "excluded": result.excluded_files,
-                    "processed": result.processed_files,
-                    "failed": result.failed_files,
-                },
+                "status": "\n".join(summary_lines),
+                "archive_path": None,
+                "batch_dir": str(batch.batch_dir),
+                "batch_summary_path": str(batch.summary_path),
+                "batch_items": [
+                    {
+                        "input_path": str(it.input_path),
+                        "input_name": it.input_path.name,
+                        "status": it.status,
+                        "output_archive": str(it.output_archive) if it.output_archive else None,
+                        "error": it.error,
+                        "profiling_report_path": str(it.result.profiling_report_path)
+                        if it.result is not None and it.result.profiling_report_path is not None
+                        else None,
+                        "suggested_rules_path": str(it.result.suggested_rules_path)
+                        if it.result is not None and it.result.suggested_rules_path is not None
+                        else None,
+                    }
+                    for it in batch.items
+                ],
             }
         )
     except Exception as exc:  # noqa: BLE001 (UI boundary)
@@ -811,12 +928,10 @@ def _run_pipeline_thread(
         )
 
 
-def _dry_run(run: PreparedRun) -> str:
-    if run.input_path is None:
-        return "DRY RUN\n- Input: (missing)\n"
+def _dry_run_single(run: PreparedRun, input_path: Path) -> str:
     user_rules = load_rules(run.rules_path)
 
-    with handle_input(run.input_path) as prepared:
+    with handle_input(input_path) as prepared:
         base_dir = prepared.working_dir
         files = prepared.files
         patterns = list(default_patterns())
@@ -829,9 +944,7 @@ def _dry_run(run: PreparedRun) -> str:
         )
         filtered = [f for f in files if not (exclude_filter and exclude_filter.should_exclude(f))]
 
-    zip_path = _default_output_archive_path(
-        run.output_dir, run.input_path, anonymize_filenames=bool(run.anonymize_filenames)
-    )
+    zip_path = _default_output_archive_path(run.output_dir, input_path, anonymize_filenames=bool(run.anonymize_filenames))
     exclude_info = f"builtin={len(default_patterns())}"
     if run.exclude_path is not None:
         try:
@@ -843,7 +956,7 @@ def _dry_run(run: PreparedRun) -> str:
             exclude_info = str(run.exclude_path)
     lines = [
         "DRY RUN",
-        f"- Input: {run.input_path}",
+        f"- Input: {input_path}",
         f"- Output dir: {run.output_dir}",
         f"- Output archive: {zip_path}",
         f"- User rules loaded: {len(user_rules)} (built-in rules are enabled by default)",
@@ -854,6 +967,11 @@ def _dry_run(run: PreparedRun) -> str:
     if len(filtered) > 20:
         preview.append(f"  ... ({len(filtered) - 20} more)")
     return "\n".join(lines + preview)
+
+
+@st.cache_data(show_spinner=False)
+def _read_bytes_cached(path: str) -> bytes:
+    return Path(path).read_bytes()
 
 
 def _attach_streamlit_logger(q: Queue[str], *, verbose: bool) -> tuple[logging.Handler, list[logging.Handler]]:
@@ -900,6 +1018,7 @@ def _pump_logs_once() -> None:
 
 def _pump_progress_once() -> None:
     q: Queue[ProgressEvent] = st.session_state["progress_queue"]
+    batch_mode = bool(st.session_state.get("batch_mode"))
     while True:
         try:
             ev = q.get_nowait()
@@ -912,20 +1031,37 @@ def _pump_progress_once() -> None:
         if ev.message:
             st.session_state["progress_stage_message"] = ev.message
 
-        if ev.kind == ProgressKind.STAGE_START and ev.stage == ProgressStage.PROCESSING:
-            st.session_state["progress_files_done"] = 0
-            st.session_state["progress_files_total"] = ev.total
-        if ev.kind == ProgressKind.STAGE_PROGRESS and ev.stage == ProgressStage.PROCESSING:
+        if batch_mode and ev.stage == ProgressStage.PROCESSING and ev.kind in (
+            ProgressKind.STAGE_START,
+            ProgressKind.STAGE_PROGRESS,
+            ProgressKind.STAGE_END,
+        ):
             if ev.current is not None:
-                st.session_state["progress_files_done"] = ev.current
+                st.session_state["batch_done"] = int(ev.current)
             if ev.total is not None:
+                st.session_state["batch_total"] = int(ev.total)
+            msg = str(ev.message or "")
+            if msg.startswith("input="):
+                st.session_state["batch_current_input"] = msg[len("input="):]
+            st.session_state["progress_files_total"] = None
+            st.session_state["progress_file_path"] = None
+            st.session_state["progress_file_done"] = None
+            st.session_state["progress_file_total"] = None
+        else:
+            if ev.kind == ProgressKind.STAGE_START and ev.stage == ProgressStage.PROCESSING:
+                st.session_state["progress_files_done"] = 0
                 st.session_state["progress_files_total"] = ev.total
+            if ev.kind == ProgressKind.STAGE_PROGRESS and ev.stage == ProgressStage.PROCESSING:
+                if ev.current is not None:
+                    st.session_state["progress_files_done"] = ev.current
+                if ev.total is not None:
+                    st.session_state["progress_files_total"] = ev.total
 
-        if ev.kind in (ProgressKind.FILE_START, ProgressKind.FILE_PROGRESS, ProgressKind.FILE_END):
-            if ev.path:
-                st.session_state["progress_file_path"] = ev.path
-            st.session_state["progress_file_done"] = ev.bytes_done
-            st.session_state["progress_file_total"] = ev.bytes_total
+            if ev.kind in (ProgressKind.FILE_START, ProgressKind.FILE_PROGRESS, ProgressKind.FILE_END):
+                if ev.path:
+                    st.session_state["progress_file_path"] = ev.path
+                st.session_state["progress_file_done"] = ev.bytes_done
+                st.session_state["progress_file_total"] = ev.bytes_total
 
 
 def _render_progress_panel() -> None:
@@ -942,6 +1078,22 @@ def _render_progress_panel() -> None:
     file_total = st.session_state.get("progress_file_total")
 
     st.subheader("Progress")
+
+    if bool(st.session_state.get("batch_mode")):
+        done = int(st.session_state.get("batch_done") or 0)
+        tot = st.session_state.get("batch_total")
+        current_input = str(st.session_state.get("batch_current_input") or "")
+        if tot is not None and int(tot) > 0:
+            frac = min(1.0, float(done) / float(tot))
+            label = f"Inputs: {done}/{tot}"
+            if current_input:
+                label += f" (current: {current_input})"
+            st.progress(frac, text=label)
+        else:
+            st.progress(0.0, text="Inputs: (waiting)")
+        if stage_msg:
+            st.caption(f"Stage: {stage} ({stage_msg})" if stage else stage_msg)
+        return
 
     if files_total is not None and int(files_total) > 0:
         frac = min(1.0, float(files_done) / float(files_total))
@@ -978,6 +1130,11 @@ def _pump_outcome_once() -> None:
 
         if outcome.get("type") == "done":
             st.session_state["run_status"] = str(outcome.get("status") or "Completed.")
+            batch_items = outcome.get("batch_items")
+            if isinstance(batch_items, list) and batch_items:
+                st.session_state["batch_items"] = batch_items
+                st.session_state["result_zip_bytes"] = None
+                st.session_state["result_zip_name"] = None
             archive_path = outcome.get("archive_path")
             if isinstance(archive_path, str) and archive_path:
                 p = Path(archive_path)

@@ -14,6 +14,7 @@ from log_anonymizer.exclude_filter import ExcludeFilter, default_patterns, load_
 from log_anonymizer.input_handler import handle_input
 from log_anonymizer import __version__
 from log_anonymizer.profiling.runner import run_sensitive_data_profiling
+from log_anonymizer.batch import process_batch_with_result
 from log_anonymizer.processor import ProcessorConfig, process
 from log_anonymizer.progress import ProgressEvent, ProgressStopToken, QueueProgressReporter
 from log_anonymizer.progress_cli import start_cli_progress_thread
@@ -23,7 +24,7 @@ from log_anonymizer.rules_loader import load_rules
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="log-anonymizer",
-        description="Anonymize Hadoop/Cloudera logs (directory, file, or archive). Writes a single .tar.gz archive into the output directory.",
+        description="Anonymize Hadoop/Cloudera logs (directory, file, or archive). Writes one .tar.gz archive per input.",
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument(
@@ -31,14 +32,16 @@ def _build_parser() -> argparse.ArgumentParser:
         "-i",
         type=Path,
         required=True,
-        help="Input path (directory, single file, or .zip/.tar.gz archive).",
+        action="append",
+        dest="inputs",
+        help="Input path (directory, single file, or .zip/.tar.gz archive). Repeat to process multiple inputs in one run.",
     )
     parser.add_argument(
         "--output",
         "-o",
         type=Path,
         required=True,
-        help="Output directory where a single .tar.gz archive will be written.",
+        help="Output directory. For a single input, one .tar.gz is written here. For multiple inputs, a batch subfolder is created with one output per input.",
     )
     parser.add_argument(
         "--rules",
@@ -113,6 +116,17 @@ def _build_parser() -> argparse.ArgumentParser:
         default=5,
         help="Max parallel workers when --parallel is enabled (default: 5).",
     )
+    parser.add_argument(
+        "--batch-parallel",
+        action="store_true",
+        help="Enable parallel processing across multiple top-level inputs (default: disabled).",
+    )
+    parser.add_argument(
+        "--batch-max-workers",
+        type=int,
+        default=2,
+        help="Max parallel workers for batch inputs when --batch-parallel is enabled (default: 2).",
+    )
     pg = parser.add_mutually_exclusive_group()
     pg.add_argument(
         "--progress",
@@ -145,13 +159,16 @@ def main(argv: list[str] | None = None) -> None:
         level = args.log_level or cfg.logging.level or "INFO"
     setup_logging(level=level, log_format=log_format)
 
-    input_path = args.input
+    inputs: list[Path] = list(args.inputs or [])
     output_path = args.output
     rules_path = args.rules
     exclude_path = args.exclude
 
-    if not input_path.exists():
-        _die(f"Input path does not exist: {input_path}")
+    if not inputs:
+        _die("At least one --input is required.")
+    for p in inputs:
+        if not p.exists():
+            _die(f"Input path does not exist: {p}")
     if rules_path is not None and not rules_path.exists():
         _die(f"Rules file does not exist: {rules_path}")
     if exclude_path is not None and not exclude_path.exists():
@@ -160,9 +177,11 @@ def main(argv: list[str] | None = None) -> None:
         _die("--no-default-rules requires providing --rules (otherwise there are no rules to apply).")
     if args.max_workers is not None and args.max_workers <= 0:
         _die(f"--max-workers must be >= 1 (got {args.max_workers})")
+    if args.batch_max_workers is not None and args.batch_max_workers <= 0:
+        _die(f"--batch-max-workers must be >= 1 (got {args.batch_max_workers})")
 
     # Normalize for reproducibility in logs.
-    input_path = input_path.resolve()
+    inputs = [p.resolve() for p in inputs]
     output_path = output_path.resolve()
     rules_path = rules_path.resolve() if rules_path is not None else None
     exclude_path = exclude_path.resolve() if exclude_path is not None else None
@@ -175,33 +194,75 @@ def main(argv: list[str] | None = None) -> None:
                 if p.strip()
             ) or ("email", "ipv4", "token", "card")
             if args.profile_sensitive_data:
-                res = run_sensitive_data_profiling(
-                    input_path=input_path,
+                if len(inputs) == 1:
+                    res = run_sensitive_data_profiling(
+                        input_path=inputs[0],
+                        output_dir=output_path,
+                        exclude_path=exclude_path,
+                        exclude_case_insensitive=bool(args.exclude_case_insensitive),
+                        detectors=detectors,
+                        profiling_report_path=args.profiling_report,
+                        suggest_rules_output_path=args.suggest_rules_output,
+                    )
+                    print("DRY RUN (profiling only)")
+                    print(f"- Input: {inputs[0]}")
+                    print(f"- Output dir: {output_path}")
+                    print(f"- Profiling report: {res.profiling_report_path}")
+                    print(f"- Suggested rules: {res.suggested_rules_path}")
+                    print(
+                        f"- Files: total={res.total_files}, excluded={res.excluded_files}, profiled={res.profiled_files}"
+                    )
+                    return
+                print("DRY RUN (profiling only, batch)")
+                print(f"- Inputs: {len(inputs)}")
+                print(f"- Output dir: {output_path}")
+                for idx, p in enumerate(inputs, start=1):
+                    item_dir = output_path / "batch-dry-run" / f"{idx:03d}-{p.name}"
+                    res = run_sensitive_data_profiling(
+                        input_path=p,
+                        output_dir=item_dir,
+                        exclude_path=exclude_path,
+                        exclude_case_insensitive=bool(args.exclude_case_insensitive),
+                        detectors=detectors,
+                        profiling_report_path=(item_dir / (args.profiling_report.name if args.profiling_report else "profiling_report.json")).resolve()
+                        if args.profiling_report is not None
+                        else None,
+                        suggest_rules_output_path=(item_dir / (args.suggest_rules_output.name if args.suggest_rules_output else "suggested_rules.json")).resolve()
+                        if args.suggest_rules_output is not None
+                        else None,
+                    )
+                    print(f"  - {p}")
+                    print(f"    - Profiling report: {res.profiling_report_path}")
+                    print(f"    - Suggested rules: {res.suggested_rules_path}")
+                    print(
+                        f"    - Files: total={res.total_files}, excluded={res.excluded_files}, profiled={res.profiled_files}"
+                    )
+                return
+            if len(inputs) == 1:
+                _dry_run(
+                    input_path=inputs[0],
                     output_dir=output_path,
+                    rules_path=rules_path,
                     exclude_path=exclude_path,
                     exclude_case_insensitive=bool(args.exclude_case_insensitive),
-                    detectors=detectors,
-                    profiling_report_path=args.profiling_report,
-                    suggest_rules_output_path=args.suggest_rules_output,
-                )
-                print("DRY RUN (profiling only)")
-                print(f"- Input: {input_path}")
-                print(f"- Output dir: {output_path}")
-                print(f"- Profiling report: {res.profiling_report_path}")
-                print(f"- Suggested rules: {res.suggested_rules_path}")
-                print(
-                    f"- Files: total={res.total_files}, excluded={res.excluded_files}, profiled={res.profiled_files}"
+                    include_builtin=not bool(args.no_default_rules),
+                    anonymize_filenames=bool(args.anonymize_filenames),
                 )
                 return
-            _dry_run(
-                input_path=input_path,
-                output_dir=output_path,
-                rules_path=rules_path,
-                exclude_path=exclude_path,
-                exclude_case_insensitive=bool(args.exclude_case_insensitive),
-                include_builtin=not bool(args.no_default_rules),
-                anonymize_filenames=bool(args.anonymize_filenames),
-            )
+            print("DRY RUN (batch)")
+            print(f"- Inputs: {len(inputs)}")
+            print(f"- Output dir: {output_path}")
+            for idx, p in enumerate(inputs, start=1):
+                item_dir = output_path / "batch-dry-run" / f"{idx:03d}-{p.name}"
+                _dry_run(
+                    input_path=p,
+                    output_dir=item_dir,
+                    rules_path=rules_path,
+                    exclude_path=exclude_path,
+                    exclude_case_insensitive=bool(args.exclude_case_insensitive),
+                    include_builtin=not bool(args.no_default_rules),
+                    anonymize_filenames=bool(args.anonymize_filenames),
+                )
             return
 
         detectors = tuple(
@@ -238,12 +299,26 @@ def main(argv: list[str] | None = None) -> None:
             reporter = QueueProgressReporter(q)
             t = start_cli_progress_thread(q, stop)
         try:
-            out_zip = process(
-                input_path=input_path,
+            if len(inputs) == 1:
+                out_zip = process(
+                    input_path=inputs[0],
+                    rules_path=rules_path,
+                    output_dir=output_path,
+                    exclude_path=exclude_path,
+                    config=cfg,
+                    progress=reporter,
+                )
+                print(str(out_zip))
+                return
+
+            batch = process_batch_with_result(
+                inputs=inputs,
                 rules_path=rules_path,
                 output_dir=output_path,
                 exclude_path=exclude_path,
                 config=cfg,
+                batch_parallel_enabled=bool(args.batch_parallel),
+                batch_max_workers=int(args.batch_max_workers or 2),
                 progress=reporter,
             )
         finally:
@@ -251,7 +326,22 @@ def main(argv: list[str] | None = None) -> None:
                 stop.stop()
             if t is not None:
                 t.join(timeout=2.0)
-        print(str(out_zip))
+        # Batch output: one line per input + summary path.
+        any_failed = False
+        print("BATCH RESULT")
+        print(f"- Batch directory: {batch.batch_dir}")
+        for it in batch.items:
+            if it.status == "success":
+                print(f"- OK: {it.input_path} -> {it.output_archive}")
+            else:
+                any_failed = any_failed or (it.status == "failed")
+                detail = f" ({it.error})" if it.error else ""
+                print(f"- {it.status.upper()}: {it.input_path}{detail}")
+                if it.output_archive:
+                    print(f"  - Output: {it.output_archive}")
+        print(f"- Summary JSON: {batch.summary_path}")
+        if any_failed:
+            raise SystemExit(1)
     except KeyboardInterrupt:
         raise SystemExit(130) from None
     except BrokenPipeError:

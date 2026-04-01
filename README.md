@@ -16,11 +16,14 @@ The project ships with a minimal set of built-in rules (IPs, Kerberos principals
 
 ## Features
 
-- Inputs: directory, single file, `.zip` archive, or `.tar.gz` archive
-- Outputs: a single `.tar.gz` archive written inside the `--output` directory (preserves structure)
+- Inputs: one or more items (directory, single file, `.zip`, `.tar.gz`)
+- Outputs:
+  - single input: one `.tar.gz` archive written inside the `--output` directory (preserves structure)
+  - multiple inputs: one batch folder under `--output`, with one `.tar.gz` archive per input + `batch_summary.json`
 - `.exclude` support (glob patterns) to exclude sensitive/binary/large artifacts from both processing and output archive
 - Built-in Hadoop-focused redaction rules + optional user-provided rules (`rules.json`)
 - Optional parallel file processing (off by default; configurable max workers, default 5)
+- Optional parallel input processing for batch runs (separate worker pool from per-file parallelism)
 - Structured logging (JSON) at `INFO` by default (configurable)
 - Streams large files line-by-line (memory efficient); never anonymizes non-text/binary files (but can include them in the output archive unless excluded)
 
@@ -49,6 +52,21 @@ Example anonymization run:
 ```bash
 log-anonymizer --input tmp_test/in --output tmp_test/out
 ```
+
+Batch run (multiple inputs in one execution):
+
+```bash
+log-anonymizer \
+  --input tmp_test/in \
+  --input tmp_test/bundle.zip \
+  --input tmp_test/support.tar.gz \
+  --output tmp_test/out \
+  --batch-parallel --batch-max-workers 3
+```
+
+Output layout (batch):
+- `tmp_test/out/batch-YYYYMMDD-HHMMSS/001-<input-name>/.../*.tar.gz`
+- `tmp_test/out/batch-YYYYMMDD-HHMMSS/batch_summary.json`
 
 ## Run (UI)
 
@@ -81,6 +99,11 @@ You can also run `make build` if you prefer.
 ## Install from wheel
 
 See `docs/INSTALL_WHEEL.md` (end users) and `docs/RELEASE.md` (admins).
+
+## Guides
+
+- User Guide: `docs/USER_GUIDE.md`
+- Admin Guide: `docs/ADMIN_GUIDE.md`
 
 ## Docker
 
@@ -194,7 +217,7 @@ streamlit run app.py
 
 The UI exposes the same options as the CLI, plus:
 - live logs
-- download button for the resulting archive
+- multi-upload batch mode (one output archive per input)
 - optional sensitive-data profiling (heuristic) + suggested rules download
 - editable **Rules** and **Exclude** tabs (view/modify uploaded content interactively)
 - **Preview anonymisation** tab to test anonymization on pasted log lines (no files written)
