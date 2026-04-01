@@ -11,6 +11,7 @@ from typing import Literal
 
 from log_anonymizer.processor import ProcessorConfig, ProcessorResult, process_with_result
 from log_anonymizer.progress import (
+    ProgressEvent,
     ProgressKind,
     ProgressReporter,
     ProgressStage,
@@ -110,6 +111,7 @@ def process_batch_with_result(
     batch_parallel_enabled: bool = False,
     batch_max_workers: int = 2,
     batch_dir_name: str | None = None,
+    include_item_progress: bool = False,
     progress: ProgressReporter | None = None,
 ) -> BatchResult:
     """
@@ -145,19 +147,51 @@ def process_batch_with_result(
             )
         )
 
+    class _TaggedProgress(ProgressReporter):
+        def __init__(self, inner: ProgressReporter, *, input_name: str, prefix: str) -> None:
+            self._inner = inner
+            self._input_name = input_name
+            self._prefix = prefix
+
+        def emit(self, event: ProgressEvent) -> None:
+            msg = f"input={self._input_name}"
+            if event.message:
+                msg += f" {event.message}"
+            path = f"{self._prefix}{event.path}" if event.path else None
+            self._inner.emit(
+                ProgressEvent(
+                    kind=event.kind,
+                    stage=event.stage,
+                    ts_monotonic=event.ts_monotonic,
+                    current=event.current,
+                    total=event.total,
+                    path=path,
+                    bytes_done=event.bytes_done,
+                    bytes_total=event.bytes_total,
+                    ok=event.ok,
+                    message=msg,
+                )
+            )
+
     def _run_one(idx: int, input_path: Path) -> BatchItemResult:
         safe = _safe_output_component(input_path.name)
         item_dir = (batch_dir / f"{idx:03d}-{safe}").resolve()
         item_dir.mkdir(parents=True, exist_ok=True)
         item_cfg = _derive_per_input_config(cfg, output_dir=item_dir)
-        # Avoid mixing per-file events for different inputs.
+        item_progress = None
+        if include_item_progress and progress is not None:
+            item_progress = _TaggedProgress(
+                progress,
+                input_name=input_path.name,
+                prefix=f"{idx:03d}-{safe}/",
+            )
         result = process_with_result(
             input_path=input_path,
             rules_path=rules_path,
             output_dir=item_dir,
             exclude_path=exclude_path,
             config=item_cfg,
-            progress=None,
+            progress=item_progress,
         )
         status: BatchItemStatus
         if result.cancelled:
@@ -225,7 +259,7 @@ def process_batch_with_result(
                         stage=ProgressStage.PROCESSING,
                         current=done,
                         total=total,
-                        message=f"input={p.name}",
+                        message=f"batch_input={p.name}",
                     )
                 )
     else:
@@ -290,7 +324,7 @@ def process_batch_with_result(
                                 stage=ProgressStage.PROCESSING,
                                 current=done,
                                 total=total,
-                                message=f"input={p.name}",
+                                message=f"batch_input={p.name}",
                             )
                         )
 

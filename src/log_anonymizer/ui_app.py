@@ -886,6 +886,7 @@ def _run_pipeline_thread(
             config=cfg,
             batch_parallel_enabled=bool(run.batch_parallel_enabled),
             batch_max_workers=int(run.batch_max_workers or 2),
+            include_item_progress=True,
             progress=reporter,
         )
         elapsed_s = int(round(time.perf_counter() - t0))
@@ -1031,23 +1032,25 @@ def _pump_progress_once() -> None:
         if ev.message:
             st.session_state["progress_stage_message"] = ev.message
 
+        msg = str(ev.message or "")
         if batch_mode and ev.stage == ProgressStage.PROCESSING and ev.kind in (
             ProgressKind.STAGE_START,
             ProgressKind.STAGE_PROGRESS,
             ProgressKind.STAGE_END,
-        ):
+        ) and (msg.startswith("batch_") or msg == "batch_start" or msg == "batch_done"):
             if ev.current is not None:
                 st.session_state["batch_done"] = int(ev.current)
             if ev.total is not None:
                 st.session_state["batch_total"] = int(ev.total)
-            msg = str(ev.message or "")
-            if msg.startswith("input="):
-                st.session_state["batch_current_input"] = msg[len("input="):]
-            st.session_state["progress_files_total"] = None
-            st.session_state["progress_file_path"] = None
-            st.session_state["progress_file_done"] = None
-            st.session_state["progress_file_total"] = None
+            if msg.startswith("batch_input="):
+                st.session_state["batch_current_input"] = msg[len("batch_input="):]
         else:
+            if batch_mode and msg.startswith("input="):
+                # Per-input tagged progress; show nested progress for that input.
+                name = msg[len("input="):].split(" ", 1)[0].strip()
+                if name:
+                    st.session_state["batch_current_input"] = name
+
             if ev.kind == ProgressKind.STAGE_START and ev.stage == ProgressStage.PROCESSING:
                 st.session_state["progress_files_done"] = 0
                 st.session_state["progress_files_total"] = ev.total
@@ -1091,9 +1094,10 @@ def _render_progress_panel() -> None:
             st.progress(frac, text=label)
         else:
             st.progress(0.0, text="Inputs: (waiting)")
-        if stage_msg:
+        if stage_msg and (stage_msg.startswith("batch_") or stage_msg in ("batch_start", "batch_done")):
             st.caption(f"Stage: {stage} ({stage_msg})" if stage else stage_msg)
-        return
+        st.markdown("#### Current input")
+        # Continue below to render nested per-input progress when available.
 
     if files_total is not None and int(files_total) > 0:
         frac = min(1.0, float(files_done) / float(files_total))
