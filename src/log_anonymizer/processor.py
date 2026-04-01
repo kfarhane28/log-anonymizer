@@ -168,6 +168,7 @@ def process_with_result(
         if cfg.include_builtin_rules
         else user_rules
     )
+    enabled_rules = [r for r in rules if getattr(r, "enabled", True)]
 
     tmp_out_dir = Path(tempfile.mkdtemp(prefix="log-anonymizer-out-")).resolve()
     try:
@@ -230,13 +231,13 @@ def process_with_result(
                 extra={"reason": "non_text"},
             )
 
-            if anonymize_files and not rules:
+            if anonymize_files and not enabled_rules:
                 raise ValueError("No valid rules loaded; refusing to process.")
 
             output_relpath_for = None
             if cfg.anonymize_filenames:
                 rels = [_safe_relative(p, working_dir) for p in included_files]
-                fn = FilenameAnonymizer(rules=rules, action_context=action_context)
+                fn = FilenameAnonymizer(rules=enabled_rules, action_context=action_context)
                 rel_map, stats = fn.build_relpath_map(rels)
                 logger.info(
                     "filename_anonymization_enabled",
@@ -345,7 +346,7 @@ def process_with_result(
                 files=anonymize_files,
                 working_dir=working_dir,
                 output_dir=tmp_out_dir,
-                rules=rules,
+                rules=enabled_rules,
                 parallel_enabled=bool(cfg.parallel_enabled),
                 max_workers=int(cfg.max_workers),
                 progress=progress,

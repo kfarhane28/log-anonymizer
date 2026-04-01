@@ -49,6 +49,11 @@ def validate_rules_json_bytes(raw: bytes) -> str | None:
         if not isinstance(search, str) or not search.strip():
             return f"rules[{i}].search must be a non-empty string"
 
+        if "enable" in r and r["enable"] is not None and not isinstance(r["enable"], (bool, str, int, float)):
+            return f"rules[{i}].enable must be boolean"
+        if "enabled" in r and r["enabled"] is not None and not isinstance(r["enabled"], (bool, str, int, float)):
+            return f"rules[{i}].enabled must be boolean"
+
         if "trigger" in r and r["trigger"] is not None and not isinstance(r["trigger"], str):
             return f"rules[{i}].trigger must be a string"
         if "description" in r and r["description"] is not None and not isinstance(r["description"], str):
@@ -74,4 +79,3 @@ def validate_rules_json_bytes(raw: bytes) -> str | None:
             return f"rules[{i}].replace must be a string"
 
     return None
-

@@ -50,21 +50,22 @@ def preview_anonymization(req: PreviewAnonymizationRequest) -> PreviewAnonymizat
     rules = (
         merge_rules(builtin=default_rules(), user=user_rules) if req.include_builtin_rules else list(user_rules)
     )
-    if not rules:
+    enabled_rules = [r for r in rules if getattr(r, "enabled", True)]
+    if not enabled_rules:
         raise ValueError("No rules available for preview (provide --rules or enable built-in rules).")
 
     logger.info(
         "preview_start",
-        extra={"lines_in": lines_in, "rules": len(rules), "builtin": bool(req.include_builtin_rules)},
+        extra={"lines_in": lines_in, "rules": len(enabled_rules), "builtin": bool(req.include_builtin_rules)},
     )
-    anonymized_text, stats = anonymize_text_block(text, rules)
+    anonymized_text, stats = anonymize_text_block(text, enabled_rules)
     lines_out = _count_lines(anonymized_text)
     logger.info(
         "preview_done",
         extra={
             "lines_in": lines_in,
             "lines_out": lines_out,
-            "rules": len(rules),
+            "rules": len(enabled_rules),
             "replacements": stats.total_replacements,
             "triggered_rules": len(stats.triggered_rules),
         },
@@ -88,7 +89,7 @@ def preview_anonymization(req: PreviewAnonymizationRequest) -> PreviewAnonymizat
         anonymized_text=anonymized_text,
         lines_in=lines_in,
         lines_out=lines_out,
-        rules_count=len(rules),
+        rules_count=len(enabled_rules),
         stats=stats,
         line_details=tuple(line_details),
     )

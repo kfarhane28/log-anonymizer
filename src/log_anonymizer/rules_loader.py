@@ -24,6 +24,7 @@ class Rule:
         replacement: Replacement string passed to `re.sub`.
         case_sensitive: Whether trigger check and regex are case sensitive.
         action: Optional action strategy controlling how replacements are produced.
+        enabled: Whether the rule is active (default: true). Disabled rules are ignored.
     """
 
     description: str
@@ -32,6 +33,7 @@ class Rule:
     replacement: str
     case_sensitive: bool
     action: RuleAction | None = None
+    enabled: bool = True
 
     def __post_init__(self) -> None:
         # Preserve backward compatibility for code/tests constructing Rule(...) directly.
@@ -43,6 +45,8 @@ class Rule:
             object.__setattr__(self, "replacement", self.action.value)
 
     def triggered_by(self, line: str) -> bool:
+        if not self.enabled:
+            return False
         if not self.trigger:
             return True
         if self.case_sensitive:
@@ -62,6 +66,7 @@ def load_rules(rules_path: Path, *, strict: bool = False) -> list[Rule]:
           "description": "...",
           "trigger": "...",
           "search": "...",
+          "enable": true,               # optional; when omitted defaults to true
           "replace": "...",              # legacy fixed replacement
           "action": {"type": "...", ...} # new action-based format
           "caseSensitive": "false"
@@ -134,6 +139,9 @@ def _parse_rule(raw: Any, *, index: int, rules_path: Path, strict: bool) -> Rule
     if not isinstance(search, str) or not search:
         return _invalid_rule(index=index, description=description, strict=strict, reason="missing_search")
 
+    enabled_raw = raw.get("enable", raw.get("enabled", None))
+    enabled = _normalize_enabled(enabled_raw, default=True)
+
     action: RuleAction | None = None
     replacement = ""
     if "action" in raw and raw.get("action") is not None:
@@ -192,6 +200,7 @@ def _parse_rule(raw: Any, *, index: int, rules_path: Path, strict: bool) -> Rule
         replacement=replacement,
         case_sensitive=case_sensitive,
         action=action,
+        enabled=enabled,
     )
 
 
@@ -209,6 +218,23 @@ def _normalize_case_sensitive(value: Any, *, default: bool) -> bool:
     if isinstance(value, (int, float)):
         return bool(value)
     logger.warning("invalid_caseSensitive_value", extra={"value": str(value)})
+    return default
+
+
+def _normalize_enabled(value: Any, *, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in ("true", "1", "yes", "y"):
+            return True
+        if v in ("false", "0", "no", "n"):
+            return False
+    if isinstance(value, (int, float)):
+        return bool(value)
+    logger.warning("invalid_enable_value", extra={"value": str(value)})
     return default
 
 

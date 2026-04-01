@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from log_anonymizer.rules_loader import Rule, load_rules
+from log_anonymizer.anonymizer import anonymize_text_block
 
 
 def test_load_rules_valid_and_invalid_regex(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
@@ -61,3 +62,35 @@ def test_load_rules_rejects_wrong_version(tmp_path: Path) -> None:
     p.write_text(json.dumps({"version": 3, "rules": []}), encoding="utf-8")
     with pytest.raises(ValueError):
         load_rules(p)
+
+
+def test_rules_support_enable_flag_and_default_enabled(tmp_path: Path) -> None:
+    rules_json = {
+        "version": 1,
+        "rules": [
+            {
+                "description": "disabled",
+                "enable": False,
+                "trigger": "SECRET=",
+                "search": r"SECRET=[^ ]+",
+                "replace": "SECRET=[REDACTED]",
+            },
+            {
+                "description": "enabled_by_default",
+                "trigger": "SECRET=",
+                "search": r"SECRET=[^ ]+",
+                "replace": "SECRET=[REDACTED]",
+            },
+        ],
+    }
+    p = tmp_path / "rules.json"
+    p.write_text(json.dumps(rules_json), encoding="utf-8")
+
+    rules = load_rules(p, strict=True)
+    assert [r.description for r in rules] == ["disabled", "enabled_by_default"]
+    assert rules[0].enabled is False
+    assert rules[1].enabled is True
+
+    out, stats = anonymize_text_block("SECRET=abc\n", rules)
+    assert out == "SECRET=[REDACTED]\n"
+    assert stats.total_replacements == 1

@@ -1442,12 +1442,22 @@ def _write_default_rules_file(tmp_dir: Path) -> Path:
 def _ensure_rules_editor_initialized() -> None:
     if st.session_state.get("rules_editor_df_v1") is None:
         st.session_state["rules_editor_df_v1"] = pd.DataFrame(
-            columns=["description", "trigger", "search", "replace", "caseSensitive"]
+            columns=["enable", "description", "trigger", "search", "replace", "caseSensitive"]
         )
+    else:
+        df = st.session_state.get("rules_editor_df_v1")
+        if isinstance(df, pd.DataFrame) and "enable" not in df.columns:
+            df.insert(0, "enable", True)
+            st.session_state["rules_editor_df_v1"] = df
     if st.session_state.get("rules_editor_df_v2") is None:
         st.session_state["rules_editor_df_v2"] = pd.DataFrame(
-            columns=["description", "trigger", "search", "action", "caseSensitive"]
+            columns=["enable", "description", "trigger", "search", "action", "caseSensitive"]
         )
+    else:
+        df = st.session_state.get("rules_editor_df_v2")
+        if isinstance(df, pd.DataFrame) and "enable" not in df.columns:
+            df.insert(0, "enable", True)
+            st.session_state["rules_editor_df_v2"] = df
     if st.session_state.get("rules_editor_mode") not in ("table_v1", "table_v2", "json"):
         st.session_state["rules_editor_mode"] = "table_v1"
     # Initialize the radio label only when missing/invalid; do not force it on every rerun.
@@ -1508,6 +1518,7 @@ def _on_add_rule_clicked() -> None:
                 pd.DataFrame(
                     [
                         {
+                            "enable": True,
                             "description": "",
                             "trigger": "",
                             "search": "",
@@ -1528,6 +1539,7 @@ def _on_add_rule_clicked() -> None:
                 pd.DataFrame(
                     [
                         {
+                            "enable": True,
                             "description": "",
                             "trigger": "",
                             "search": "",
@@ -1547,10 +1559,10 @@ def _on_add_rule_clicked() -> None:
 def _on_reset_rules_clicked() -> None:
     _ensure_rules_editor_initialized()
     st.session_state["rules_editor_df_v1"] = pd.DataFrame(
-        columns=["description", "trigger", "search", "replace", "caseSensitive"]
+        columns=["enable", "description", "trigger", "search", "replace", "caseSensitive"]
     )
     st.session_state["rules_editor_df_v2"] = pd.DataFrame(
-        columns=["description", "trigger", "search", "action", "caseSensitive"]
+        columns=["enable", "description", "trigger", "search", "action", "caseSensitive"]
     )
     st.session_state["rules_editor_mode"] = "table_v1"
     st.session_state["rules_editor_mode_radio"] = "Table (v1)"
@@ -1576,6 +1588,7 @@ def _sig(name: str, raw: bytes) -> str:
 def _rules_df_to_json_bytes(df: "pd.DataFrame") -> bytes:
     rules: list[dict[str, Any]] = []
     for _, row in df.iterrows():
+        enabled = row.get("enable")
         description = str(row.get("description") or "").strip()
         trigger = str(row.get("trigger") or "").strip()
         search = str(row.get("search") or "").strip()
@@ -1591,6 +1604,8 @@ def _rules_df_to_json_bytes(df: "pd.DataFrame") -> bytes:
             "search": search,
             "replace": replace,
         }
+        if enabled is not None and str(enabled).strip() != "":
+            rule["enable"] = bool(enabled)
         if case_sensitive is not None and str(case_sensitive).strip() != "":
             rule["caseSensitive"] = case_sensitive
         rules.append(rule)
@@ -1604,6 +1619,7 @@ def _rules_dfs_to_json_bytes(df_v1: "pd.DataFrame", df_v2: "pd.DataFrame") -> by
 
     # v1 (legacy) table: search + replace.
     for _, row in df_v1.iterrows():
+        enabled = row.get("enable")
         description = str(row.get("description") or "").strip()
         trigger = str(row.get("trigger") or "").strip()
         search = str(row.get("search") or "").strip()
@@ -1613,12 +1629,15 @@ def _rules_dfs_to_json_bytes(df_v1: "pd.DataFrame", df_v2: "pd.DataFrame") -> by
         if not trigger and not search and replace == "" and not description:
             continue
         rule: dict[str, Any] = {"description": description, "trigger": trigger, "search": search, "replace": replace}
+        if enabled is not None and str(enabled).strip() != "":
+            rule["enable"] = bool(enabled)
         if case_sensitive is not None and str(case_sensitive).strip() != "":
             rule["caseSensitive"] = case_sensitive
         rules.append(rule)
 
     # v2 (action) table: search + action object.
     for _, row in df_v2.iterrows():
+        enabled = row.get("enable")
         description = str(row.get("description") or "").strip()
         trigger = str(row.get("trigger") or "").strip()
         search = str(row.get("search") or "").strip()
@@ -1640,6 +1659,8 @@ def _rules_dfs_to_json_bytes(df_v1: "pd.DataFrame", df_v2: "pd.DataFrame") -> by
                 action_obj = action_text
 
         rule = {"description": description, "trigger": trigger, "search": search, "action": action_obj}
+        if enabled is not None and str(enabled).strip() != "":
+            rule["enable"] = bool(enabled)
         if case_sensitive is not None and str(case_sensitive).strip() != "":
             rule["caseSensitive"] = case_sensitive
         rules.append(rule)
@@ -1747,9 +1768,11 @@ def _maybe_load_rules_upload_into_editor(raw: bytes, *, name: str) -> None:
     for r in rules:
         if not isinstance(r, dict):
             continue
+        enabled = r.get("enable", r.get("enabled", True))
         if r.get("action") is not None:
             rows_v2.append(
                 {
+                    "enable": bool(enabled) if enabled is not None else True,
                     "description": r.get("description", ""),
                     "trigger": r.get("trigger", ""),
                     "search": r.get("search", ""),
@@ -1760,6 +1783,7 @@ def _maybe_load_rules_upload_into_editor(raw: bytes, *, name: str) -> None:
         else:
             rows_v1.append(
                 {
+                    "enable": bool(enabled) if enabled is not None else True,
                     "description": r.get("description", ""),
                     "trigger": r.get("trigger", ""),
                     "search": r.get("search", ""),
@@ -1769,10 +1793,10 @@ def _maybe_load_rules_upload_into_editor(raw: bytes, *, name: str) -> None:
             )
 
     st.session_state["rules_editor_df_v1"] = pd.DataFrame(
-        rows_v1, columns=["description", "trigger", "search", "replace", "caseSensitive"]
+        rows_v1, columns=["enable", "description", "trigger", "search", "replace", "caseSensitive"]
     )
     st.session_state["rules_editor_df_v2"] = pd.DataFrame(
-        rows_v2, columns=["description", "trigger", "search", "action", "caseSensitive"]
+        rows_v2, columns=["enable", "description", "trigger", "search", "action", "caseSensitive"]
     )
     try:
         st.session_state["rules_editor_text"] = json.dumps(obj, ensure_ascii=False, indent=2) + "\n"
@@ -1859,6 +1883,7 @@ def _render_rules_editor() -> None:
             num_rows="dynamic",
             width="stretch",
             column_config={
+                "enable": st.column_config.CheckboxColumn("enable", help="Disable a rule without deleting it."),
                 "description": st.column_config.TextColumn("description"),
                 "trigger": st.column_config.TextColumn("trigger"),
                 "search": st.column_config.TextColumn("search (regex)"),
@@ -1876,6 +1901,7 @@ def _render_rules_editor() -> None:
             num_rows="dynamic",
             width="stretch",
             column_config={
+                "enable": st.column_config.CheckboxColumn("enable", help="Disable a rule without deleting it."),
                 "description": st.column_config.TextColumn("description"),
                 "trigger": st.column_config.TextColumn("trigger"),
                 "search": st.column_config.TextColumn("search (regex)"),
