@@ -314,6 +314,7 @@ def _init_state() -> None:
     st.session_state.setdefault("rules_editor_text", None)  # derived JSON content (from tables or last JSON edit)
     st.session_state.setdefault("rules_editor_json_widget", None)  # Streamlit widget state for JSON editor
     st.session_state.setdefault("exclude_editor_df", None)
+    st.session_state.setdefault("exclude_editor_counter", 0)  # bump to reset data_editor widget state
     st.session_state.setdefault("rules_upload_sig", None)
     st.session_state.setdefault("exclude_upload_sig", None)
     st.session_state.setdefault("preview_input", "")
@@ -1818,7 +1819,9 @@ def _maybe_load_rules_upload_into_editor(raw: bytes, *, name: str) -> None:
 def _maybe_load_exclude_upload_into_editor(raw: bytes, *, name: str) -> None:
     sig = _sig(name, raw)
     if st.session_state.get("exclude_upload_sig") == sig:
-        return
+        # If the editor was reset, allow re-applying the same uploaded file so the UI recovers.
+        if _exclude_editor_has_patterns():
+            return
     st.session_state["exclude_upload_sig"] = sig
 
     try:
@@ -1950,12 +1953,29 @@ def _render_exclude_editor() -> None:
         st.session_state["exclude_editor_df"] = df
         st.rerun()
     if b2.button("Reset exclude", key="reset_exclude"):
-        st.session_state["exclude_editor_df"] = pd.DataFrame(columns=["pattern"])
+        # Mirror "Reset rules": keep the uploaded file selected, but reset the editor back to it on rerun.
+        st.session_state["exclude_upload_sig"] = None
+        st.session_state["exclude_editor_counter"] = int(st.session_state.get("exclude_editor_counter") or 0) + 1
+
+        # If a file is currently uploaded, immediately reset the table to that file's patterns.
+        uploaded = st.session_state.get("exclude_upload")
+        if uploaded is not None:
+            try:
+                raw = bytes(uploaded.getbuffer())
+                _maybe_load_exclude_upload_into_editor(
+                    raw, name=str(getattr(uploaded, "name", ".exclude"))
+                )
+            except Exception:
+                st.session_state["exclude_editor_df"] = pd.DataFrame(columns=["pattern"])
+        else:
+            st.session_state["exclude_editor_df"] = pd.DataFrame(columns=["pattern"])
         st.rerun()
 
+    counter = int(st.session_state.get("exclude_editor_counter") or 0)
+    editor_key = f"exclude_editor_{counter}"
     edited = st.data_editor(
         st.session_state["exclude_editor_df"],
-        key="exclude_editor",
+        key=editor_key,
         num_rows="dynamic",
         width="stretch",
         column_config={"pattern": st.column_config.TextColumn("pattern")},
@@ -2018,7 +2038,12 @@ def _validate_exclude_bytes(raw: bytes, *, filename: str) -> str | None:
         if len(s) > 512:
             return "a pattern line is too long (>512 chars)"
     if not patterns:
-        st.session_state["ui_warnings"].append("Exclude file contains no patterns (only comments/blank lines).")
+        # Only warn when content exists but it contains no usable patterns.
+        # An empty exclude (no file / reset) is valid and shouldn't warn.
+        if text.strip():
+            st.session_state["ui_warnings"].append(
+                "Exclude file contains no patterns (only comments/blank lines)."
+            )
     return None
 
 
